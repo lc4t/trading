@@ -16,3 +16,4 @@ frontend/.wrangler
 .env.*
 .DS_Store
 tests
+scripts/regression
