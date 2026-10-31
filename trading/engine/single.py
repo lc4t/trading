@@ -15,7 +15,8 @@ from loguru import logger
 
 from ..analysis.metrics import PerformanceAnalyzer
 from ..analysis.report import build_report
-from ..data.repository import DBClient, TradingData
+from ..data.repository import DBClient
+from ..market.store import MarketStore
 from ..strategies.dual_ma import DualMAStrategy
 
 
@@ -50,27 +51,8 @@ def fetch_symbol_data(
     start_date: datetime,
     end_date: datetime,
 ) -> pd.DataFrame:
-    """从数据库读取单标的的 OHLCV，并做类型规整。"""
-    with db_client.Session() as session:
-        df = pd.read_sql(
-            session.query(TradingData)
-            .filter(
-                TradingData.symbol == symbol,
-                TradingData.date >= start_date,
-                TradingData.date <= end_date,
-            )
-            .statement,
-            session.bind,
-        )
-
-    if df.empty:
-        return df
-
-    df["date"] = pd.to_datetime(df["date"])
-    for col in ("open_price", "close_price", "high", "low"):
-        df[col] = df[col].astype(float)
-    df["volume"] = df["volume"].astype(float)
-    return df
+    """从数据库读取单标的的 OHLCV，并做类型规整（取数统一走 trading.market.store）。"""
+    return MarketStore(db_client.engine).ohlcv_frame(symbol, start_date, end_date)
 
 
 def fetch_benchmark_daily_returns(
@@ -82,31 +64,19 @@ def fetch_benchmark_daily_returns(
     """获取基准日收益率序列（与 1.0 算法一致）。"""
     benchmark_returns: Dict[date, float] = {}
     try:
-        with db_client.Session() as session:
-            rows = (
-                session.query(TradingData)
-                .filter(
-                    TradingData.symbol == symbol,
-                    TradingData.date >= start_date,
-                    TradingData.date <= end_date,
-                )
-                .order_by(TradingData.date)
-                .all()
-            )
+        rows = MarketStore(db_client.engine).close_series(symbol, start_date, end_date)
 
-            if not rows:
-                logger.warning(f"未找到基准数据: {symbol}")
-                return {}
+        if not rows:
+            logger.warning(f"未找到基准数据: {symbol}")
+            return {}
 
-            for i in range(1, len(rows)):
-                prev_close = float(rows[i - 1].close_price)
-                curr_close = float(rows[i].close_price)
-                if prev_close > 0:
-                    benchmark_returns[rows[i].date] = (curr_close / prev_close) - 1
+        for i in range(1, len(rows)):
+            prev_close = rows[i - 1][1]
+            curr_close = rows[i][1]
+            if prev_close > 0:
+                benchmark_returns[rows[i][0]] = (curr_close / prev_close) - 1
 
-            logger.info(
-                f"成功获取基准数据: {symbol}, 数据点数: {len(benchmark_returns)}"
-            )
+        logger.info(f"成功获取基准数据: {symbol}, 数据点数: {len(benchmark_returns)}")
     except Exception as e:  # noqa: BLE001 — 与原行为保持一致：吞掉异常并打日志
         logger.error(f"获取基准数据失败: {e}")
         logger.exception(e)

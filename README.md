@@ -17,7 +17,8 @@
 .
 ├── trading/                # Python 包
 │   ├── api.py                  # 用户态门面 run_backtest / MomentumBasket / ...
-│   ├── data/                   # 数据仓库（MySQL）+ fetcher
+│   ├── data/                   # 数据仓库（MySQL）+ fetcher（tt-fetcher）
+│   ├── market/                 # 行情缓存层：抓取 / 缓存 / 元数据，tt-fetcher、回测、MCP 共用
 │   ├── strategies/             # base / signals / dual_ma / momentum / momentum_rotation
 │   ├── engine/                 # single / multi / sweep
 │   ├── analysis/               # metrics / report
@@ -170,6 +171,115 @@ result.plot()         # → matplotlib figure
 - **执行时机**：rebalance 信号在当日收盘后产生，订单默认在 **次日开盘** 成交（backtrader 默认行为）。
 - **手续费**：通过 `commission_rate` 参数设置，默认 `0.0001`（万分之一）。
 
+## 行情缓存 + MCP 服务（`tt-serve`）
+
+同一个镜像里的另一个入口：把行情缓存在 MySQL 里，通过带鉴权的 **MCP（Streamable HTTP）** 提供给 agent；
+并把 Trading 已有的回测能力以薄封装暴露为工具。它只做行情读取、缓存和回测，不含任何持仓或投资纪律相关能力。
+
+### 配置（全部环境变量，参见 [`.env.example`](.env.example)）
+
+| 变量 | 必填 | 说明 |
+| ---- | ---- | ---- |
+| `DB_HOST` `DB_USER` `DB_PASSWORD` `DB_NAME` / `DB_PORT` | 是 | MySQL 连接，沿用现有变量；账号需要建表和读写权限 |
+| `MCP_TOKENS` 或 `MCP_TOKENS_FILE` | 是 | token 配置（见下），两者可同时用；都没有则启动失败 |
+| `MCP_HOST` / `MCP_PORT` | 否 | 监听地址 / 端口，默认 `127.0.0.1:8765`（镜像内默认 `0.0.0.0`） |
+| `MCP_RATE_LIMIT_{READ,REFRESH,BACKTEST}_PER_MIN` | 否 | 每个 token 每分钟调用上限，默认 120 / 10 / 6 |
+| `MCP_BACKTEST_{CONCURRENCY,MAX_SPAN_DAYS,MAX_SYMBOLS}` | 否 | 回测并发 / 单次区间天数 / 标的数上限，默认 2 / 3660 / 20 |
+| `MCP_ALLOWED_HOSTS` | 否 | 逗号分隔的 Host 白名单；设置后启用 DNS-rebinding 防护 |
+
+缺 MySQL 配置、缺 token 配置、token 配置非法或数据库连不上时，服务**启动即失败**并打印原因（只写变量名，不回显值）。
+启动时自动建表（含元数据旁表）。
+
+### 生成 token
+
+服务端只保存 token 的 SHA-256；明文只在生成时出现一次，交给客户端保管：
+
+```bash
+uv run tt-serve gen-token --name agent-a --scopes read
+# 输出 token 以及形如 {"name":"agent-a","scopes":["read"],"sha256":"…"} 的配置条目
+export MCP_TOKENS='[{"name":"agent-a","scopes":["read"],"sha256":"…"}, {"name":"ops","scopes":["refresh","backtest"],"sha256":"…"}]'
+```
+
+| scope | 允许 |
+| ----- | ---- |
+| `read` | 行情读取，`refresh=missing / never` |
+| `refresh` | 在 `read` 之外，允许 `refresh=always` 强制回源和 `refresh_fund_nav_cache`（按 token 限流，防止刷爆上游） |
+| `backtest` | 回测工具（独立 scope，不隐含 `read`；通常和 `read` 一起发） |
+
+缺少或错误的 token → HTTP 401；权限不足 → 403；超过限流 → 429。比较使用常量时间，日志不会出现 token 或 DB 密码。
+
+### 启动
+
+```bash
+uv run tt-serve                      # 本机
+# 容器（同一个镜像；请显式用非 root 用户）
+docker run -d --name trading-market --user 10001:10001 -p 8765:8765 \
+  -e DB_HOST=… -e DB_USER=… -e DB_PASSWORD=… -e DB_NAME=trading \
+  -e MCP_TOKENS="$MCP_TOKENS" \
+  ghcr.io/lc4t/trading-2.0:latest /app/.venv/bin/tt-serve
+```
+
+- 健康检查：`GET /healthz`，**不要求 token**，只返回 `{"status":"ok"}` / `{"status":"unavailable"}`（503），不带任何内部信息。镜像里的 `HEALTHCHECK` 只对 PID 1 是 `tt-serve` 的容器生效，每日流水线等一次性容器不受影响。
+- 镜像默认仍以 root 运行（每日流水线要往挂载的 `data/` 写文件）；服务请加 `--user 10001:10001`（镜像里已建好该用户）。
+- 服务本身不做 TLS，需要对外暴露时放在反向代理后面。
+
+### 接入 MCP 客户端
+
+端点：`http(s)://<host>:8765/mcp`，请求头 `Authorization: Bearer <token>`。
+
+```bash
+# Claude Code
+claude mcp add --transport http trading-market http://localhost:8765/mcp \
+  --header "Authorization: Bearer $TT_MCP_TOKEN"
+```
+
+```json
+{
+  "mcpServers": {
+    "trading-market": {
+      "type": "http",
+      "url": "http://localhost:8765/mcp",
+      "headers": { "Authorization": "Bearer ${TT_MCP_TOKEN}" }
+    }
+  }
+}
+```
+
+### 工具
+
+行情工具（`read`）：
+
+| 工具 | 说明 |
+| ---- | ---- |
+| `get_price_history(symbols, start_date, end_date, refresh, adjust)` | 日线 OHLCV，多标的 |
+| `get_latest_price(symbol, refresh, adjust)` | 缓存里最新一根日线（不是实时报价） |
+| `get_fund_nav_history(fund_code, start_date, end_date, refresh)` | 场外基金官方单位净值（六位代码） |
+| `get_latest_fund_nav(fund_code, refresh)` | 最新单位净值 |
+| `refresh_fund_nav_cache(fund_code, start_date, end_date)` | 强制回源（`refresh` scope） |
+
+`refresh`：`missing`（默认，缺什么补什么）/ `always`（强制回源，需 `refresh` scope）/ `never`（只读缓存）。
+返回沿用既有行情 MCP 契约的结构（`cache`、`data_fingerprint`、`count`、`data`），只做加法：每行多了
+`as_of`（数据所属时点）、`fetched_at`、`source`、`is_final`、`price_basis`；`cache[symbol]` 里多了 `coverage`、`price_basis`、`nonfinal_count` 等。
+
+回测工具（`backtest`，只读缓存里的日线、不回源、不画图；先用行情工具把数据备好）：
+`run_dual_ma_backtest`、`run_momentum_topn_backtest`、`run_momentum_basket_backtest`，入参对应 CLI / 前端表单，返回
+`metrics`、`trades`（最近 `trade_limit` 条）、`next_signal` 和每个标的的 `data_quality`（价格口径、末行是否已定稿）。
+
+### 缓存语义
+
+- **已定稿的历史日线只读，不再回源**。缓存没覆盖的区间不会静默补抓，而是在 `coverage`（`gaps` 列表）里暴露；要补就显式 `refresh=always`。
+- **当日数据允许缓存，但必须带时点**：只有抓取时刻晚于该交易日收盘 + 30 分钟才标 `is_final=true`，`as_of` = 当日收盘时刻；
+  盘中抓到的行 `is_final=false`、`as_of` = 抓取时刻。`is_final=false` 的行每次读取都按 TTL（默认 5 分钟）判断是否重抓，
+  收盘后必重抓——**即使请求的 `end` 恰好等于缓存里最新的一天**。时钟以 Asia/Shanghai 业务日为准，收盘时间按标的所在交易所（A 股 15:00、港股 16:10、美股 16:00 ET）。
+- **价格口径 `price_basis`**：新标的写入不复权价（A 股场内 → 东财 `fqt=0`，`raw`；港股美股指数 → Yahoo `auto_adjust=False`，`split_adjusted`，仅拆分调整；场外基金 → 官方单位净值 `raw`）。
+  分红/拆分事件另存 `market_corporate_actions`：检测到新的拆分时，受影响的历史行自动失效并重抓；`adjust="qfq"` 用已记录的分红即时计算前复权视图（不落库，返回里 `price_view=adjusted_qfq`）。
+  **不再用分红额扣减历史价**。
+- **遗留数据**：2.0 之前 `trading_data` 里的行没有口径记录，返回里标 `price_basis=legacy_unknown`（其中 A 股 ETF 实际来自同花顺前复权全量、
+  Yahoo 标的是 `auto_adjust` 价）。为避免同一序列混入两种口径，**已有历史行的标的继续沿用历史抓取方式**（`ths_qfq` / `yahoo_adjusted`），
+  只有全新的标的才用不复权口径；一条序列里出现多种口径时 `price_basis="mixed"`，`price_bases` 列出全部。
+- 上游失败时返回缓存并在 `tail_refresh_error` 里说明；请求路径上只做最多 2 次、间隔 ≤ 0.5s 的短重试，失败后 60 秒静默期内不再打上游。
+  （`tt-fetcher` 批量同步保留历史行为：Yahoo 限流最多 10 次、30+60n 秒退避。）
+
 ## Docker 镜像
 
 后端镜像由 [.github/workflows/docker-build.yml](.github/workflows/docker-build.yml) 自动构建并推送到 GHCR：
@@ -189,6 +299,7 @@ ghcr.io/lc4t/trading-<branch>:latest
 | `/app/trading/` | 全部 Python 源码（包） |
 | `/app/.venv/` | 构建时安装好的虚拟环境 |
 | `/app/{backtest,fetcher}.py` | 向后兼容的 CLI shim |
+| `/app/.venv/bin/tt-serve` | 行情缓存 + MCP 服务入口（见上一节），与回测/同步共用同一镜像 |
 | ~~`/app/frontend/`~~ | **不打入镜像**——前端独立部署 |
 
 ## 测试

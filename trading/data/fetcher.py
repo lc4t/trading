@@ -6,15 +6,17 @@ from abc import ABC, abstractmethod
 from tqdm import tqdm
 import tenacity
 from loguru import logger
-import yfinance as yf
 import traceback
 from .repository import DBClient
+from ..market.clock import as_of_for, is_final_snapshot, utcnow
+from ..market.fetchers import SYNC_RETRY, FetchResult, RangePriceFetcher, ths_etf_rows
+from ..market.store import MarketStore
 import argparse
-import adata
+import adata  # noqa: F401  (保留模块级属性，测试按 trading.data.fetcher.adata 打补丁)
 import pandas as pd
 import sys
 import time
-from yfinance.exceptions import YFRateLimitError
+from sqlalchemy.exc import SQLAlchemyError
 
 
 class DataFetcher(ABC):
@@ -32,7 +34,11 @@ class DataFetcher(ABC):
 
 
 class YFinanceFetcher(DataFetcher):
-    """YFinance数据获取实现"""
+    """YFinance 数据获取（历史口径：auto_adjust=True）.
+
+    实现已统一到 ``trading.market.fetchers``；这里只保留向后兼容的类名与
+    ``fetch_data`` 签名。限流沿用批量同步的长退避（SYNC_RETRY）。
+    """
 
     def fetch_data(
         self,
@@ -40,88 +46,18 @@ class YFinanceFetcher(DataFetcher):
         start_date: Union[str, datetime],
         end_date: Union[str, datetime],
     ) -> List[Dict[str, Any]]:
-        for tt in range(10):
-            try:
-                ticker = yf.Ticker(symbol)
-                # 获取历史数据，包括拆分信息
-                df = ticker.history(
-                    start=start_date,
-                    end=end_date,
-                    actions=False,
-                    # auto_adjust=True, back_adjust=True
-                )
-                if symbol == "159941.SZ" and (
-                    start_date <= datetime(2022, 7, 4).date() <= end_date
-                ):
-                    if any(df.index.date == datetime(2022, 7, 4).date()):
-                        df.loc[
-                            df.index.date == datetime(2022, 7, 4).date(),
-                            ["Open", "High", "Low", "Close"],
-                        ] /= 4
-
-                if "Dividends" in df.columns:
-                    dividends = df[df["Dividends"] != 0]["Dividends"]
-                    if not dividends.empty:
-                        for div_date, div_amount in dividends.items():
-                            logger.warning(
-                                f"检测到股票 {symbol} 在 {div_date.date()} 分红 {div_amount:.4f}"
-                            )
-                            # 对分红日期之前的价格进行调整
-                            for col in ["Open", "High", "Low", "Close"]:
-                                df.loc[:div_date, col] = df.loc[:div_date, col] - div_amount
-
-                # 检查是否有拆分事件
-                if "Stock Splits" in df.columns:
-                    splits = df[df["Stock Splits"] != 0]["Stock Splits"]
-                    if not splits.empty:
-                        for split_date, split_ratio in splits.items():
-                            logger.warning(
-                                f"检测到股票 {symbol} 在 {split_date.date()} 发生 1:{split_ratio} 拆分"
-                            )
-                            # 对拆分日期之前的价格进行调整
-                            for col in ["Open", "High", "Low", "Close"]:
-                                df.loc[:split_date, col] = (
-                                    df.loc[:split_date, col] / split_ratio
-                                )
-                            # 对拆分日期之前的成交量进行调整
-                            df.loc[:split_date, "Volume"] = (
-                                df.loc[:split_date, "Volume"] * split_ratio
-                            )
-
-                if not df.empty:
-                    logger.info(
-                        f"{symbol} 数据统计:\n价格范围: {df['Low'].min():.2f}-{df['High'].max():.2f}\n"
-                        f"成交量范围: {df['Volume'].min()}-{df['Volume'].max()}"
-                    )
-
-                return [
-                    {
-                        "symbol": symbol,
-                        "date": index.date(),
-                        "open_price": float(row["Open"]),
-                        "close_price": float(row["Close"]),
-                        "high": float(row["High"]),
-                        "low": float(row["Low"]),
-                        "volume": int(row["Volume"]),
-                        "amount": None,
-                        "change": None,
-                        "change_pct": None,
-                    }
-                    for index, row in df.iterrows()
-                ]
-            except YFRateLimitError as e:
-                time.sleep(30+60*tt)
-                logger.error(f"YFinance API rate limit exceeded: {e}")
-                traceback.print_exc()
-                continue
-            except Exception as e:
-                logger.error(f"Error fetching data from YFinance: {e}")
-                traceback.print_exc()
-                return []
+        try:
+            return RangePriceFetcher(retry=SYNC_RETRY).fetch_yahoo(
+                symbol, start_date, end_date, retry=SYNC_RETRY, legacy=True
+            ).rows
+        except Exception as e:
+            logger.error(f"Error fetching data from YFinance: {e}")
+            traceback.print_exc()
+            return []
 
 
 class ADataFetcher(DataFetcher):
-    """AData数据获取实现"""
+    """AData（同花顺）ETF 数据获取，前复权全量历史（忽略区间）."""
 
     def fetch_data(
         self,
@@ -131,56 +67,7 @@ class ADataFetcher(DataFetcher):
     ) -> List[Dict[str, Any]]:
         try:
             logger.info(f"正在获取 {symbol} 的数据 ({start_date} 至 {end_date})")
-
-            # https://adata.30006124.xyz/dic/fund.html#_1-k%E7%BA%BF
-            data = adata.fund.market.get_market_etf(symbol.split(".")[0], k_type=1)
-
-            if data.empty:
-                logger.warning(f"No data fetched for {symbol} from AData")
-                return []
-
-            df = pd.DataFrame(data)
-
-            # df = df[(df["trade_time"] >= start_date) & (df["trade_time"] <= end_date)]
-
-            if not df.empty:
-                logger.info(
-                    f"{symbol} 数据统计:\n价格范围: {df['low'].min()}-{df['high'].max()}\n"
-                    f"成交量范围: {df['volume'].min()}-{df['volume'].max()}"
-                )
-
-            result = []
-            for _, record in df.iterrows():
-                result.append(
-                    {
-                        "symbol": symbol,
-                        "date": datetime.strptime(
-                            record["trade_date"], "%Y-%m-%d"
-                        ).date(),
-                        "open_price": float(record["open"]),
-                        "close_price": float(record["close"]),
-                        "high": float(record["high"]),
-                        "low": float(record["low"]),
-                        "volume": int(record["volume"]),
-                        "amount": (
-                            float(record["amount"])
-                            if pd.notna(record["amount"])
-                            else None
-                        ),
-                        "change": (
-                            float(record["change"])
-                            if pd.notna(record["change"])
-                            else None
-                        ),
-                        "change_pct": (
-                            float(record["change_pct"])
-                            if pd.notna(record["change_pct"])
-                            else None
-                        ),
-                    }
-                )
-            return result
-
+            return ths_etf_rows(symbol)
         except Exception as e:
             logger.error(f"Error fetching data from AData: {e}")
             traceback.print_exc()
@@ -192,8 +79,11 @@ class StockDataManager:
         self.db_client = DBClient()
         self.max_workers = max_workers
         self.max_retries = max_retries
-        self.yfinance_fetcher = YFinanceFetcher()
-        self.adata_fetcher = ADataFetcher()
+        # 抓取 / 落库统一走 trading.market：同一套路由、口径判定与元数据
+        self.market_fetcher = RangePriceFetcher(retry=SYNC_RETRY)
+        self.market_store = MarketStore(self.db_client.engine)
+        self.market_store.ensure_meta_tables()
+        self._results: Dict[str, FetchResult] = {}
 
     @staticmethod
     def count_trading_days(start_date, end_date) -> int:
@@ -222,13 +112,14 @@ class StockDataManager:
     ) -> List[Dict[str, Any]]:
         """获取单个股票的数据，带重试机制"""
         logger.info(f"正在获取 {symbol} 的数据 ({start_date} 至 {end_date})")
-        # 如果是A股ETF, 就用adata, 其他用yfinance
-        if symbol.split(".")[-1].upper() in ["SZ", "SS"] and symbol not in [
-            "000300.SS"
-        ]:
-            data = self.adata_fetcher.fetch_data(symbol, start_date, end_date)
-        else:
-            data = self.yfinance_fetcher.fetch_data(symbol, start_date, end_date)
+        # 路由由 trading.market.fetchers 决定：已有历史行的标的沿用历史口径抓取
+        # （A 股 ETF → 同花顺前复权全量，其余 → Yahoo auto_adjust），新标的走不复权口径。
+        mode = self.market_store.series_mode(symbol)
+        result = self.market_fetcher.fetch(
+            symbol, start_date, end_date, mode=mode, retry=SYNC_RETRY
+        )
+        self._results[symbol] = result
+        data = result.rows
 
         if data:
             # 获取实际数据的时间范围
@@ -247,6 +138,28 @@ class StockDataManager:
             )
 
         return data
+
+    def _persist(self, symbol: str, rows: List[Dict[str, Any]]) -> bool:
+        """写 trading_data（语义与历史 upsert 一致）并记录价格口径等元数据."""
+        result = self._results.get(symbol)
+        fetched_at = utcnow()
+        finals = {r["date"]: is_final_snapshot(symbol, r["date"], fetched_at) for r in rows}
+        as_of = {d: as_of_for(symbol, d, fetched_at, f) for d, f in finals.items()}
+        try:
+            written = self.market_store.upsert(
+                rows,
+                price_basis=result.price_basis if result else None,
+                source=result.source if result else None,
+                fetched_at=fetched_at,
+                final_flags=finals,
+                as_of=as_of,
+            )
+        except SQLAlchemyError as e:
+            logger.error(f"Error upserting data: {e}")
+            return False
+        if not written:
+            logger.error("清洗后没有可写入的数据（全部记录都缺失开高低收）")
+        return written > 0
 
     def fetch_data(
         self,
@@ -333,7 +246,7 @@ class StockDataManager:
                                         f"可能是还没开盘或数据未更新"
                                     )
 
-                                if not self.db_client.upsert_trading_data(data):
+                                if not self._persist(symbol, data):
                                     success = False
                                     logger.error(f"Failed to save data for {symbol}")
                             else:
