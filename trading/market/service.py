@@ -16,7 +16,6 @@ from .clock import to_iso
 from .errors import RequestError
 
 MAX_SYMBOLS_PER_REQUEST = 50
-_FINGERPRINT_FIELDS = ("symbol", "date", "open_price", "close_price", "high", "low", "volume")
 
 
 class NoDataError(RuntimeError):
@@ -35,16 +34,41 @@ def serialize_row(row: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+_LEGACY_COLUMNS = (
+    "symbol", "date", "open_price", "close_price", "high", "low",
+    "volume", "amount", "change", "change_pct",
+)  # fmt: skip
+
+
 def fingerprint(rows: Sequence[Dict[str, Any]]) -> str:
-    canonical = [
-        [str(r["date"]) if k == "date" else r[k] for k in _FINGERPRINT_FIELDS]
-        + [r["price_basis"], bool(r["is_final"])]
-        for r in rows
-    ]
+    """``data_fingerprint``：与 quant-engine 的同名字段算法逐字一致（只覆盖行情数值列，不含元数据）。
+
+    步骤：按 (date, symbol) 排序去重 → 取 symbol/date/开高低收/成交量/成交额/涨跌/涨跌幅 十列 →
+    date 用 ``Timestamp.isoformat()`` → ``json.dumps(sort_keys, 紧凑分隔, default=str)`` → sha256。
+    """
+    import pandas as pd
+
+    frame = pd.DataFrame.from_records([{c: r.get(c) for c in _LEGACY_COLUMNS} for r in rows])
+    frame["symbol"] = frame["symbol"].astype(str).str.strip().str.upper()
+    frame["date"] = pd.to_datetime(frame["date"])
+    frame.sort_values(["date", "symbol"], inplace=True)
+    frame.drop_duplicates(["date", "symbol"], keep="last", inplace=True)
+    canonical = []
+    for row in frame.reindex(columns=list(_LEGACY_COLUMNS)).itertuples(index=False):
+        canonical.append([v.isoformat() if isinstance(v, pd.Timestamp) else v for v in row])
     encoded = json.dumps(
         canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def state_fingerprint(rows: Sequence[Dict[str, Any]]) -> str:
+    """在行情数值之外还覆盖 price_basis / is_final：盘中行转为定稿、口径变化时它会变."""
+    canonical = [
+        [str(r["symbol"]), str(r["date"]), r["price_basis"], bool(r["is_final"])] for r in rows
+    ]
+    encoded = json.dumps(canonical, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded + fingerprint(rows).encode()).hexdigest()
 
 
 class MarketService:
@@ -122,6 +146,7 @@ class MarketService:
         return {
             "cache": cache_info,
             "data_fingerprint": fingerprint(views),
+            "state_fingerprint": state_fingerprint(views),
             "count": len(views),
             "data": [serialize_row(v) for v in views],
         }

@@ -38,7 +38,7 @@ def test_empty_token_list_counts_as_unconfigured(tmp_path):
 def test_single_mcp_token_defaults_to_read_scope(tmp_path):
     config = load_config({**DB, "MCP_TOKEN": TOKEN, "MCP_CONFIG_DIR": str(tmp_path)})
     principal = config.tokens.authenticate(TOKEN)
-    assert principal.name == "default" and principal.scopes == frozenset({"read"})
+    assert principal.name == "env" and principal.scopes == frozenset({"read"})
     config = load_config({**DB, "MCP_TOKEN": TOKEN, "MCP_TOKEN_SCOPES": "refresh", "MCP_CONFIG_DIR": str(tmp_path)})
     assert config.tokens.authenticate(TOKEN).allows("refresh")
 
@@ -156,7 +156,7 @@ def test_gen_token_prints_hash_entry(capsys):
         serve.main(["gen-token", "--name", "agent-1", "--scopes", "read,refresh"])
     assert exc.value.code == 0
     out = capsys.readouterr().out
-    token = next(line.strip() for line in out.splitlines() if line.strip().startswith("ttm_"))
+    token = next(line.strip() for line in out.splitlines() if line.strip().startswith("trading_mcp_"))
     entry = json.loads(next(line.strip() for line in out.splitlines() if line.strip().startswith("{")))
     assert entry["sha256"] == hash_token(token).hex() and entry["scopes"] == ["read", "refresh"]
     assert token not in json.dumps(entry)
@@ -245,12 +245,12 @@ def test_token_cli_new_rotate_list(monkeypatch, tmp_path, capsys):
         return exc.value.code, capsys.readouterr()
 
     code, out = run("token", "new", "--name", "ops", "--scopes", "read,refresh")
-    assert code == 0 and "ttm_" in out.out
-    first = next(x.strip() for x in out.out.splitlines() if x.strip().startswith("ttm_"))
+    assert code == 0 and "trading_mcp_" in out.out
+    first = next(x.strip() for x in out.out.splitlines() if x.strip().startswith("trading_mcp_"))
     code, out = run("token", "list")
     assert code == 0 and "ops" in out.out and "refresh" in out.out and first not in out.out
     code, out = run("token", "rotate", "--name", "ops")
-    second = next(x.strip() for x in out.out.splitlines() if x.strip().startswith("ttm_"))
+    second = next(x.strip() for x in out.out.splitlines() if x.strip().startswith("trading_mcp_"))
     assert code == 0 and second != first
     assert run("token", "new", "--name", "ops")[0] == 2  # 重名
     assert run("token", "new", "--name", "x", "--scopes", "root")[0] == 2
@@ -261,8 +261,48 @@ def test_bootstrap_banner_marks_non_persistent_tokens(capsys):
 
     from trading.market.auth import Bootstrap
 
-    serve._announce_bootstrap(Bootstrap("ttm_example", False, Path("/data/config/tokens.json")))
+    serve._announce_bootstrap(Bootstrap("trading_mcp_example", False, Path("/data/config/tokens.json")))
     err = capsys.readouterr().err
-    assert "重启后会变" in err and "ttm_example" in err
-    serve._announce_bootstrap(Bootstrap("ttm_example2", True, Path("/data/config/tokens.json")))
+    assert "重启后会变" in err and "trading_mcp_example" in err
+    serve._announce_bootstrap(Bootstrap("trading_mcp_example2", True, Path("/data/config/tokens.json")))
     assert "重启不会再显示" in capsys.readouterr().err
+
+
+# ---------------------------------------------- token 前缀 / 来源关系 / gen-token 条目
+def test_generated_tokens_use_new_prefix_and_old_prefix_still_authenticates(tmp_path):
+    from trading.market.auth import TOKEN_PREFIX, generate_token
+
+    assert TOKEN_PREFIX == "trading_mcp_" and generate_token().startswith("trading_mcp_")
+    old = "ttm_" + "o" * 40  # 旧前缀的 token：校验只比对哈希，不受前缀影响
+    entry = {"name": "legacy", "scopes": ["read"], "sha256": hash_token(old).hex()}
+    config = load_config({**DB, "MCP_TOKENS": tokens(entry), "MCP_CONFIG_DIR": str(tmp_path)})
+    assert config.tokens.authenticate(old).name == "legacy"
+    assert config.tokens.authenticate("x" + old) is None
+
+
+def test_env_and_config_dir_tokens_coexist_and_env_token_name_does_not_clash(tmp_path):
+    store = TokenStore(tmp_path)
+    file_token = store.add("default", ["refresh"])  # 配置目录里自动生成的那个也叫 default
+    config = load_config({**DB, "MCP_TOKEN": TOKEN, "MCP_TOKENS": tokens(good_entry("a")), "MCP_CONFIG_DIR": str(tmp_path)})
+    assert len(config.tokens) == 3  # MCP_TOKEN + MCP_TOKENS + 文件，取并集
+    assert config.tokens.authenticate(file_token).allows("refresh")
+    assert config.tokens.authenticate(TOKEN).name in {"env", "a"}  # 同一串明文出现两次时先出现的（环境变量）生效
+    assert [src for _, _, src in config.tokens.describe()].count("file") == 1
+    assert bootstrap_token(config.tokens, store) is None  # 已有 token，不再自动生成
+
+
+def test_gen_token_entry_can_be_pasted_into_mcp_tokens(capsys, tmp_path):
+    with pytest.raises(SystemExit):
+        serve.main(["gen-token", "--name", "agent-x", "--scopes", "read,refresh"])
+    out = capsys.readouterr().out
+    token = next(x.strip() for x in out.splitlines() if x.strip().startswith("trading_mcp_"))
+    entry = next(x.strip() for x in out.splitlines() if x.strip().startswith("{"))
+    config = load_config({**DB, "MCP_TOKENS": f"[{entry}]", "MCP_CONFIG_DIR": str(tmp_path)})
+    principal = config.tokens.authenticate(token)
+    assert principal.name == "agent-x" and principal.allows("refresh")
+
+
+def test_mcp_token_minimum_length_is_24():
+    with pytest.raises(ConfigError):
+        load_config({**DB, "MCP_TOKEN": "x" * 23})
+    assert load_config({**DB, "MCP_TOKEN": "x" * 24}).tokens.authenticate("x" * 24) is not None

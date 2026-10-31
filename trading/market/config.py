@@ -81,7 +81,7 @@ def env_token_entries(env: Mapping[str, str]) -> tuple[list[str], list[str]]:
     single = env.get("MCP_TOKEN")
     if single:
         scopes = [s.strip() for s in (env.get("MCP_TOKEN_SCOPES") or "read").split(",") if s.strip()]
-        documents.append(json.dumps([{"name": "default", "scopes": scopes, "token": single}]))
+        documents.append(json.dumps([{"name": "env", "scopes": scopes, "token": single}]))
     if env.get("MCP_TOKENS"):
         documents.append(env["MCP_TOKENS"])
     token_file = env.get("MCP_TOKENS_FILE")

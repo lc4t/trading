@@ -34,8 +34,11 @@ def hash_token(token: str) -> bytes:
     return hashlib.sha256(token.encode("utf-8")).digest()
 
 
+TOKEN_PREFIX = "trading_mcp_"  # 仅用于辨认/检索，校验只比对 SHA-256，不依赖前缀
+
+
 def generate_token() -> str:
-    return "ttm_" + secrets.token_urlsafe(32)
+    return TOKEN_PREFIX + secrets.token_urlsafe(32)
 
 
 @dataclass(frozen=True)

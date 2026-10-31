@@ -213,13 +213,16 @@ DB 账号只有 `SELECT`（例如仅限 `trading_data` 与 `symbol_info`）也�
 | `refresh` | 在 `read` 之外，允许 `refresh=always` 强制回源和 `refresh_fund_nav_cache`（按 token 限流，防止刷爆上游） |
 | `backtest` | 回测工具（独立 scope，不隐含 `read`；通常和 `read` 一起发） |
 
-token 来源，按需组合：
+token 来源（**取并集，没有优先级之分**，任何一个来源里的有效 token 都能通过校验）：
 
-1. **什么都不配（最省事）**：首次启动自动生成一个 `read` token，在启动日志里用醒目的块**只显示这一次明文**，把哈希写入
-   `$MCP_CONFIG_DIR/tokens.json`（权限 0600，只存哈希）。之后重启不再显示。**一定要给 `/data/config` 挂卷**；
-   目录不可写时服务照常运行，但会明确警告「重启后 token 会变」。
-2. `MCP_TOKEN=…`：单个 token，范围默认 `read`。
-3. `MCP_TOKENS` / `MCP_TOKENS_FILE`：JSON 数组，每项 `{"name","scopes","sha256"}`，用 `trading-mcp gen-token` 生成条目。
+1. `MCP_TOKEN=…`：单个 token，**至少 24 个字符**，名字固定为 `env`，范围默认 `read`（`MCP_TOKEN_SCOPES` 可改，逗号分隔）。
+2. `MCP_TOKENS` / `MCP_TOKENS_FILE`：JSON 数组，每项 `{"name","scopes","sha256"}`（也接受明文 `token`，至少 24 字符，进内存即转哈希）；两者可同时用。`trading-mcp gen-token` 输出的那一行 JSON 条目可以直接放进数组里。
+3. 配置目录 `$MCP_CONFIG_DIR/tokens.json`：`trading-mcp token new|rotate|list` 管理，也是自动生成的 token 的存放处，只存哈希。
+
+三个来源同时存在时全部生效；名字在不同来源之间不能重复（重复会启动失败，所以 `MCP_TOKEN` 用 `env` 这个名字，避开自动生成的 `default`）；
+同一串 token 若在多个来源出现，先出现的生效（顺序：`MCP_TOKEN`、`MCP_TOKENS`、`MCP_TOKENS_FILE`、配置目录）。
+**只有三个来源里一个 token 都没有时**才会自动生成；一旦有了（比如先生成过，之后又加了 `MCP_TOKEN`），自动生成的那个仍然有效、不会再次生成或展示。
+token 由 `trading_mcp_` 前缀加随机串组成，前缀只用于辨认；校验只比对 SHA-256，不依赖前缀，所以旧前缀（`ttm_`）的 token 不受影响。
 
 ```bash
 trading-mcp token new --name ops --scopes read,refresh,backtest   # 新建（明文只显示这一次）
@@ -290,7 +293,8 @@ claude mcp add --transport http trading-market http://localhost:8765/mcp \
 | `refresh_fund_nav_cache(fund_code, start_date, end_date)` | 强制回源（`refresh` scope） |
 
 `refresh`：`missing`（默认，缺什么补什么）/ `always`（强制回源，需 `refresh` scope）/ `never`（只读缓存）。
-返回沿用既有行情 MCP 契约的结构（`cache`、`data_fingerprint`、`count`、`data`），只做加法：每行多了
+返回沿用既有行情 MCP 契约的结构（`cache`、`data_fingerprint`、`count`、`data`），只做加法：
+`data_fingerprint` 的算法与既有契约逐字一致（只覆盖行情数值列，不含元数据，盘中行变定稿但数值不变时它不变）；新增的 `state_fingerprint` 额外覆盖 `price_basis` / `is_final`。每行多了
 `as_of`（数据所属时点）、`fetched_at`、`source`、`is_final`、`price_basis`；`cache[symbol]` 里多了 `coverage`、`price_basis`、`nonfinal_count` 等。
 
 回测工具（`backtest`，只读缓存里的日线、不回源、不画图；先用行情工具把数据备好）：
