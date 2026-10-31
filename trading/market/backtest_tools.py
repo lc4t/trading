@@ -1,7 +1,7 @@
 """Phase B：把 Trading 已有的回测能力以薄封装暴露为 MCP 工具（需 ``backtest`` scope）.
 
 只读取库里已缓存的日线，不回源、不画图；回测引擎（backtrader）在第一次调用时才惰性导入，
-tt-serve 启动本身不加载它。重 CPU 的回测放在线程里跑，并发数、区间长度、标的数都有上限。
+trading-mcp 启动本身不加载它。重 CPU 的回测放在线程里跑，并发数、区间长度、标的数都有上限。
 """
 from __future__ import annotations
 

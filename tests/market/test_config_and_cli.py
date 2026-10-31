@@ -118,7 +118,7 @@ def test_rate_limiter_sliding_window():
     assert limiter.acquire("k") is None
 
 
-# ---------------------------------------------------------------- tt-serve 入口
+# ---------------------------------------------------------------- trading-mcp 入口
 def clear_env(monkeypatch):
     for key in ("DB_HOST", "DB_USER", "DB_PASSWORD", "DB_NAME", "MCP_TOKENS", "MCP_TOKENS_FILE", "MCP_TOKEN"):
         monkeypatch.delenv(key, raising=False)

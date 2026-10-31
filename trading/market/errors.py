@@ -15,3 +15,7 @@ class RequestError(ValueError):
 
 class FetchError(MarketError):
     """上游抓取失败."""
+
+
+class ReadOnlyError(MarketError):
+    """数据库账号没有写权限（或显式只读模式）：只能读缓存，不回源."""

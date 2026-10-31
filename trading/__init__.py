@@ -7,7 +7,7 @@
 
 后续 2.0 会加入 `run_backtest()` facade + 动量策略。
 
-公共名字按需（惰性）导入：``tt-serve`` 行情服务只用 ``trading.market``，
+公共名字按需（惰性）导入：``trading-mcp`` 行情服务只用 ``trading.market``，
 不应该为了启动而加载 backtrader / 回测引擎等重依赖。
 """
 from __future__ import annotations

@@ -28,7 +28,7 @@ from .clock import (
     local_naive_to_utc,
     utcnow,
 )
-from .errors import FetchError, RequestError
+from .errors import FetchError, ReadOnlyError, RequestError
 from .fetchers import RangePriceFetcher, series_type_for_symbol, upstream_route_for_symbol
 from .models import STABLE_BASES
 from .store import MarketStore
@@ -40,6 +40,7 @@ ADJUST_MODES = ("none", "qfq")
 
 DEFAULT_TAIL_CHECK_TTL = 600.0  # 尾部（缓存最新日之后）检查间隔
 DEFAULT_INTRADAY_TTL = 300.0  # 盘中非终值行的最长缓存时间
+READ_ONLY_ERROR = "read_only"  # tail_refresh_error 的固定取值：数据库只读，没有回源
 DEFAULT_FAILURE_BACKOFF = 60.0  # 上游失败后的静默期
 GAP_TOLERANCE_DAYS = 10  # 超过它的日期缺口才算缺口（长假 + 周末约 9 天）
 
@@ -170,6 +171,8 @@ class MarketCache:
 
     def _refresh_window(self, symbol: str, start: date, end: date) -> _Outcome:
         """抓 [start, end] 并落库；检测到新的拆分事件时让更早的历史失效并补抓."""
+        if self.store.read_only:
+            raise ReadOnlyError("database is read-only")
         first_cached = self.store.first_date(symbol)
         result, _ = self._fetch_and_persist(symbol, start, end)
         self._tail_checked_at[symbol] = self._monotonic()  # 刚回过源，尾部检查间隔从现在算起
@@ -193,6 +196,8 @@ class MarketCache:
         self._tail_checked_at[symbol] = self._monotonic()
         try:
             outcome = self._refresh_window(symbol, start, end)
+        except ReadOnlyError:
+            return _Outcome(refreshed=False, error=READ_ONLY_ERROR)
         except Exception as exc:  # noqa: BLE001 - 上游任何失败都降级为返回缓存
             logger.warning(f"tail refresh failed for {symbol}: {type(exc).__name__}: {exc}")
             # 对外只给自己组装的 FetchError 文案；其它异常的消息可能带路径等内部细节，只暴露类型
@@ -229,7 +234,10 @@ class MarketCache:
             with self._lock_for(symbol):
                 raw_rows = self.store.query_range(symbol, start, end)
                 if refresh == "always" or not raw_rows:
-                    outcome = self._refresh_window(symbol, start, end)
+                    try:
+                        outcome = self._refresh_window(symbol, start, end)
+                    except ReadOnlyError:
+                        outcome = _Outcome(error=READ_ONLY_ERROR)
                     raw_rows = self.store.query_range(symbol, start, end)
         elif refresh == "missing":
             views = [self.view(symbol, r) for r in raw_rows]
@@ -270,7 +278,10 @@ class MarketCache:
             with self._lock_for(symbol):
                 row = self.store.query_latest(symbol)
                 if refresh == "always" or row is None:
-                    outcome = self._refresh_window(symbol, today - timedelta(days=45), today)
+                    try:
+                        outcome = self._refresh_window(symbol, today - timedelta(days=45), today)
+                    except ReadOnlyError:
+                        outcome = _Outcome(error=READ_ONLY_ERROR)
                     row = self.store.query_latest(symbol)
         elif refresh == "missing":
             view = self.view(symbol, row)

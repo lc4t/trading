@@ -171,7 +171,7 @@ result.plot()         # → matplotlib figure
 - **执行时机**：rebalance 信号在当日收盘后产生，订单默认在 **次日开盘** 成交（backtrader 默认行为）。
 - **手续费**：通过 `commission_rate` 参数设置，默认 `0.0001`（万分之一）。
 
-## 行情缓存 + MCP 服务（`tt-serve`）
+## 行情缓存 + MCP 服务（`trading-mcp`）
 
 同一个镜像里的另一个入口：把行情缓存在 MySQL 里，通过带鉴权的 **MCP（Streamable HTTP）** 提供给 agent；
 并把 Trading 已有的回测能力以薄封装暴露为工具。它只做行情读取、缓存和回测，不含任何持仓或投资纪律相关能力。
@@ -187,9 +187,20 @@ result.plot()         # → matplotlib figure
 | `MCP_HOST` / `MCP_PORT` | 否 | 监听地址 / 端口。本机默认 `127.0.0.1:8765`；**镜像里默认 `0.0.0.0:8765`** |
 | `MCP_RATE_LIMIT_{READ,REFRESH,BACKTEST}_PER_MIN` | 否 | 每个 token 每分钟调用上限，默认 120 / 10 / 6 |
 | `MCP_BACKTEST_{CONCURRENCY,MAX_SPAN_DAYS,MAX_SYMBOLS}` | 否 | 回测并发 / 单次区间天数 / 标的数上限，默认 2 / 3660 / 20 |
+| `MCP_READ_ONLY` | 否 | 设为 `1` 强制只读模式（见下）；账号没有写权限时也会自动进入 |
 | `MCP_ALLOWED_HOSTS` | 否 | 逗号分隔的 Host 白名单；设置后启用 DNS-rebinding 防护 |
 
 缺 `DB_*`、配置非法或数据库连不上时，服务**启动即失败**并打印原因（只写变量名，不回显值）。启动时自动建表（含元数据旁表）。
+
+### 只读数据库账号
+
+DB 账号只有 `SELECT`（例如仅限 `trading_data` 与 `symbol_info`）也能运行：启动时建表失败（没有 DDL 权限）且 `trading_data` 可读，就自动进入**只读模式**
+（也可用 `MCP_READ_ONLY=1` 显式指定，或在运行中第一次写库被 MySQL 以权限错误拒绝时切换）。只读模式下：
+
+- 不建表、不写库，也**不回源**（写不进去，抓了也没用）；已缓存的行照常返回，旁表读不到时价格口径按遗留行（`legacy_unknown`）处理。
+- 刷新类请求（`refresh=always`、尾部/非终值修复、`refresh_fund_nav_cache`）**不抛异常**，返回缓存里已有的行，并在 `tail_refresh_error` 里写固定值 `read_only`。
+- 缓存里一行都没有时没有可返回的内容，工具会返回「no rows … database is read-only」的错误。
+- 回测工具只读缓存，不受影响。
 
 ### 鉴权与 token
 
@@ -208,22 +219,22 @@ token 来源，按需组合：
    `$MCP_CONFIG_DIR/tokens.json`（权限 0600，只存哈希）。之后重启不再显示。**一定要给 `/data/config` 挂卷**；
    目录不可写时服务照常运行，但会明确警告「重启后 token 会变」。
 2. `MCP_TOKEN=…`：单个 token，范围默认 `read`。
-3. `MCP_TOKENS` / `MCP_TOKENS_FILE`：JSON 数组，每项 `{"name","scopes","sha256"}`，用 `tt-serve gen-token` 生成条目。
+3. `MCP_TOKENS` / `MCP_TOKENS_FILE`：JSON 数组，每项 `{"name","scopes","sha256"}`，用 `trading-mcp gen-token` 生成条目。
 
 ```bash
-tt-serve token new --name ops --scopes read,refresh,backtest   # 新建（明文只显示这一次）
-tt-serve token rotate --name default                          # 轮换：旧 token 立即失效，范围不变
-tt-serve token list                                           # 只显示名字、范围、来源，不显示 token
-tt-serve gen-token --name agent-a --scopes read               # 不落盘，输出可放进 MCP_TOKENS 的条目
+trading-mcp token new --name ops --scopes read,refresh,backtest   # 新建（明文只显示这一次）
+trading-mcp token rotate --name default                          # 轮换：旧 token 立即失效，范围不变
+trading-mcp token list                                           # 只显示名字、范围、来源，不显示 token
+trading-mcp gen-token --name agent-a --scopes read               # 不落盘，输出可放进 MCP_TOKENS 的条目
 ```
 
 `token new|rotate` 修改的是配置目录里的文件，运行中的服务会自动加载，不用重启。容器里这样用：
-`docker exec trading-market /app/.venv/bin/tt-serve token new --name ops --scopes read,refresh`。
+`docker exec trading-market /app/.venv/bin/trading-mcp token new --name ops --scopes read,refresh`。
 
 ### 启动
 
 ```bash
-uv run tt-serve     # 本机（MCP_CONFIG_DIR 不可写时请先指到一个可写目录）
+uv run trading-mcp     # 本机（MCP_CONFIG_DIR 不可写时请先指到一个可写目录）
 ```
 
 容器（同一个镜像，请显式用非 root 用户，并把端口只绑到宿主的回环地址）：
@@ -231,16 +242,16 @@ uv run tt-serve     # 本机（MCP_CONFIG_DIR 不可写时请先指到一个可�
 ```bash
 docker run -d --name trading-market --user 10001:10001 \
   -p 127.0.0.1:8765:8765 \
-  -v tt-config:/data/config \
+  -v trading-mcp-config:/data/config \
   -e DB_HOST=… -e DB_PORT=3306 -e DB_USER=… -e DB_PASSWORD=… -e DB_NAME=trading \
-  ghcr.io/lc4t/trading-2.0:latest /app/.venv/bin/tt-serve
+  ghcr.io/lc4t/trading-2.0:latest /app/.venv/bin/trading-mcp
 docker logs trading-market    # 首次启动会在这里显示自动生成的 token
 ```
 
 - **监听地址**：容器内 `MCP_HOST` 默认 `0.0.0.0`。实测：容器里绑 `127.0.0.1` 时，即使加了 `-p 127.0.0.1:8765:8765`，宿主也访问不到（连接直接失败），只有容器内部能访问；
   所以容器内必须监听 `0.0.0.0`，由宿主侧的 `-p` 决定对谁可见：
   `-p 127.0.0.1:8765:8765` 只有宿主本机能连（实测经宿主局域网 IP 访问被拒），再由宿主上的反向代理/域名转发出去；确实要直接对外才用 `-p 8765:8765`（实测局域网可访问，此时务必妥善保管 token，并建议前置 TLS）。
-- 健康检查：`GET /healthz`，**不要求 token**，只返回 `{"status":"ok"}` / `{"status":"unavailable"}`（503），不带任何内部信息。镜像里的 `HEALTHCHECK` 只对 PID 1 是 `tt-serve` 的容器生效，每日流水线等一次性容器不受影响。
+- 健康检查：`GET /healthz`，**不要求 token**，只返回 `{"status":"ok"}` / `{"status":"unavailable"}`（503），不带任何内部信息。镜像里的 `HEALTHCHECK` 只对 PID 1 是 `trading-mcp` 的容器生效，每日流水线等一次性容器不受影响。
 - 镜像默认仍以 root 运行（每日流水线要往挂载的 `data/` 写文件）；服务请加 `--user 10001:10001`。`/data/config` 已归该用户所有，命名卷会继承；用绑定挂载时需要把目录 `chown 10001:10001`，否则会走「不可写」告警。
 - 服务本身不做 TLS，需要对外暴露时放在反向代理后面。
 
@@ -320,7 +331,7 @@ ghcr.io/lc4t/trading-<branch>:latest
 | `/app/trading/` | 全部 Python 源码（包） |
 | `/app/.venv/` | 构建时安装好的虚拟环境 |
 | `/app/{backtest,fetcher}.py` | 向后兼容的 CLI shim |
-| `/app/.venv/bin/tt-serve` | 行情缓存 + MCP 服务入口（见上一节），与回测/同步共用同一镜像 |
+| `/app/.venv/bin/trading-mcp` | 行情缓存 + MCP 服务入口（见上一节），与回测/同步共用同一镜像 |
 | ~~`/app/frontend/`~~ | **不打入镜像**——前端独立部署 |
 
 ## 测试

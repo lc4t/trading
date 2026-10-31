@@ -65,6 +65,7 @@ class ServerConfig:
     port: int = 8765
     allowed_hosts: tuple[str, ...] = ()
     config_dir: str = DEFAULT_CONFIG_DIR
+    read_only: bool = False
     read_rate_per_min: int = 120
     refresh_rate_per_min: int = 10
     backtest_rate_per_min: int = 6
@@ -132,5 +133,6 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> ServerConfig:
         port=port,
         allowed_hosts=hosts,
         config_dir=env.get("MCP_CONFIG_DIR") or DEFAULT_CONFIG_DIR,
+        read_only=(env.get("MCP_READ_ONLY") or "").strip().lower() in {"1", "true", "yes", "on"},
         **extra,
     )

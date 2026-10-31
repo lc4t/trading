@@ -13,11 +13,12 @@ import pandas as pd
 from loguru import logger
 from sqlalchemy import and_, func, text, update
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from ..data.repository import Base, TradingData
 from .clock import business_naive_now
+from .errors import ReadOnlyError
 from .rows import PRICE_FIELDS, clean_rows
 from .models import (
     META_TABLES,
@@ -28,6 +29,14 @@ from .models import (
 
 _QUANT = Decimal(f"0.{'0' * TradingData.STORAGE_SCALE}")
 EPOCH = dt.datetime(1970, 1, 1)
+# MySQL：1044/1142/1143/1227 = 库/表/列/操作权限不足，1290 = 服务器 --read-only
+PRIVILEGE_ERRNOS = frozenset({1044, 1142, 1143, 1227, 1290, 1370})
+
+
+def is_privilege_error(exc: BaseException) -> bool:
+    orig = getattr(exc, "orig", None)
+    args = getattr(orig, "args", ())
+    return bool(args) and isinstance(args[0], int) and args[0] in PRIVILEGE_ERRNOS
 
 
 def _quantize(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -57,8 +66,27 @@ class MarketStore:
         # 旁表建不出来（例如 DB 账号没有 DDL 权限）时降级为只写 trading_data，
         # 保证 tt-fetcher 每日同步不受影响；MCP 服务启动时则要求必须可用。
         self.meta_enabled = True
+        # 只读：账号没有写权限（显式配置或运行时探测到）。读照常，写一律拒绝
+        self.read_only = False
 
     # ------------------------------------------------------------------ schema
+    def configure_read_only(self) -> None:
+        """进入只读模式：不建表、不写库。旁表能读就继续用，读不了就退回遗留行推断."""
+        self.read_only = True
+        self.meta_enabled = True
+        try:
+            with self.engine.connect() as conn:
+                for table in META_TABLES:
+                    conn.execute(text(f"SELECT 1 FROM {table.name} LIMIT 1"))
+        except SQLAlchemyError:
+            self.meta_enabled = False
+
+    def _writing(self):
+        """写操作的统一入口：只读直接拒绝；执行中遇到权限错误则转为只读."""
+        if self.read_only:
+            raise ReadOnlyError("database is read-only")
+        return _WriteGuard(self)
+
     def init_schema(self) -> None:
         """建表（含元数据旁表），失败直接抛出——MCP 服务启动用."""
         Base.metadata.create_all(self.engine)
@@ -242,6 +270,8 @@ class MarketStore:
         ``price_basis`` 为 None 时只写 trading_data（元数据降级模式）。
         返回实际写入的行数。
         """
+        if self.read_only:
+            raise ReadOnlyError("database is read-only")
         cleaned = clean_rows(rows)
         if not cleaned:
             return 0
@@ -271,7 +301,7 @@ class MarketStore:
         }
         stmt = self._apply_conflict(stmt, update_cols, ["symbol", "date"])
 
-        with self.Session() as session:
+        with self._writing(), self.Session() as session:
             session.execute(stmt)
             if price_basis is not None and self.meta_enabled:
                 fetched = fetched_at or dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
@@ -318,7 +348,7 @@ class MarketStore:
         """
         if not self.meta_enabled:
             return 0
-        with self.Session() as session:
+        with self._writing(), self.Session() as session:
             result = session.execute(
                 update(MarketDataMeta)
                 .where(MarketDataMeta.symbol == symbol, MarketDataMeta.date < before)
@@ -336,7 +366,7 @@ class MarketStore:
         if not actions or not self.meta_enabled:
             return []
         new: List[Dict[str, Any]] = []
-        with self.Session() as session:
+        with self._writing(), self.Session() as session:
             known = {
                 (a.ex_date, a.kind)
                 for a in session.query(MarketCorporateAction).filter(
@@ -374,3 +404,18 @@ class MarketStore:
 
     def close(self) -> None:
         self.engine.dispose()
+
+
+class _WriteGuard:
+    def __init__(self, store: "MarketStore") -> None:
+        self.store = store
+
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if isinstance(exc, DBAPIError) and is_privilege_error(exc):
+            self.store.read_only = True
+            logger.warning("数据库账号没有写权限，切换为只读模式")
+            raise ReadOnlyError("database is read-only") from None
+        return False

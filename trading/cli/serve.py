@@ -1,9 +1,9 @@
-"""tt-serve：行情缓存 + 鉴权 MCP（Streamable HTTP）服务入口.
+"""trading-mcp：行情缓存 + 鉴权 MCP（Streamable HTTP）服务入口.
 
-    tt-serve                 启动服务（默认）
-    tt-serve token new|rotate|list   管理配置目录里的 token（只存哈希）
-    tt-serve gen-token       生成 token 及其 sha256 配置条目（不落盘，用于 MCP_TOKENS）
-    tt-serve healthcheck     容器健康检查（非服务容器直接返回 0）
+    trading-mcp                 启动服务（默认）
+    trading-mcp token new|rotate|list   管理配置目录里的 token（只存哈希）
+    trading-mcp gen-token       生成 token 及其 sha256 配置条目（不落盘，用于 MCP_TOKENS）
+    trading-mcp healthcheck     容器健康检查（非服务容器直接返回 0）
 """
 from __future__ import annotations
 
@@ -100,8 +100,8 @@ def _announce_bootstrap(boot) -> None:
     if boot.persisted:
         lines += [
             f"  已把它的 SHA-256 保存到 {boot.path}（权限 0600）；重启不会再显示。",
-            "  请现在保存到客户端的密钥管理里；忘了就用  tt-serve token rotate --name default  轮换。",
-            "  需要更多权限：tt-serve token new --name ops --scopes read,refresh,backtest",
+            "  请现在保存到客户端的密钥管理里；忘了就用  trading-mcp token rotate --name default  轮换。",
+            "  需要更多权限：trading-mcp token new --name ops --scopes read,refresh,backtest",
         ]
     else:
         lines += [
@@ -113,13 +113,13 @@ def _announce_bootstrap(boot) -> None:
 
 
 def _healthcheck(_: argparse.Namespace) -> int:
-    # 同一个镜像也跑回测/同步命令；只有 PID 1 是 tt-serve 的容器才需要探活
+    # 同一个镜像也跑回测/同步命令；只有 PID 1 是 trading-mcp 的容器才需要探活
     try:
         with open("/proc/1/cmdline", "rb") as f:
             cmdline = f.read().decode("utf-8", "replace")
     except OSError:
         cmdline = ""
-    if "tt-serve" not in cmdline and "trading.cli.serve" not in cmdline:
+    if "trading-mcp" not in cmdline and "trading.cli.serve" not in cmdline:
         return 0
     port = os.environ.get("MCP_PORT") or "8765"
     try:
@@ -136,7 +136,7 @@ def _serve(_: argparse.Namespace) -> int:
     from ..market.fetchers import RangePriceFetcher
     from ..market.server import create_app
     from ..market.service import MarketService
-    from ..market.store import MarketStore
+    from ..market.store import MarketStore, is_privilege_error
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     log = logging.getLogger("trading.market")
@@ -159,11 +159,24 @@ def _serve(_: argparse.Namespace) -> int:
                 print(f"启动失败: 无法连接 MySQL（{type(exc).__name__}），请检查 DB_* 配置", file=sys.stderr)
                 return 2
             time.sleep(2)
-    try:
-        store.init_schema()
-    except Exception as exc:  # noqa: BLE001
-        print(f"启动失败: 建表失败（{type(exc).__name__}），DB 账号需要 CREATE 权限", file=sys.stderr)
-        return 2
+    if config.read_only:
+        store.configure_read_only()
+        log.warning("只读模式（MCP_READ_ONLY）：不建表、不写库、不回源，只读已缓存的行")
+    else:
+        try:
+            store.init_schema()
+        except Exception as exc:  # noqa: BLE001
+            if not is_privilege_error(exc):
+                print(f"启动失败: 建表失败（{type(exc).__name__}），DB 账号需要 CREATE 权限", file=sys.stderr)
+                return 2
+            # 账号没有 DDL 权限（例如只读账号）：只要 trading_data 能读，就降级为只读模式
+            try:
+                store.configure_read_only()
+                store.query_latest("__probe__")
+            except Exception:  # noqa: BLE001
+                print("启动失败: 账号没有建表权限，且读不了 trading_data", file=sys.stderr)
+                return 2
+            log.warning("DB 账号没有建表/写权限，已自动切换为只读模式：不写库、不回源，只读已缓存的行")
 
     boot = bootstrap_token(config.tokens, TokenStore(config.config_dir))
     if boot is not None:
@@ -176,7 +189,7 @@ def _serve(_: argparse.Namespace) -> int:
     if hasattr(os, "getuid") and os.getuid() == 0:
         log.warning("正以 root 运行；建议用非 root 用户启动容器（docker run --user 10001:10001）")
     log.info(
-        "tt-serve 启动: %s:%s，已配置 %d 个 token",
+        "trading-mcp 启动: %s:%s，已配置 %d 个 token",
         config.host,
         config.port,
         len(config.tokens),
@@ -188,7 +201,7 @@ def _serve(_: argparse.Namespace) -> int:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
-    parser = argparse.ArgumentParser(prog="tt-serve", description="行情缓存 + 鉴权 MCP 服务")
+    parser = argparse.ArgumentParser(prog="trading-mcp", description="行情缓存 + 鉴权 MCP 服务")
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("serve", help="启动服务（默认）").set_defaults(func=_serve)
     gen = sub.add_parser("gen-token", help="生成 token 和 sha256 配置条目")

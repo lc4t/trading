@@ -61,7 +61,7 @@ target-version = "py313"
 tt-backtest = "trading.cli.backtest:main"
 tt-fetcher = "trading.data.fetcher:main"
 tt-digest = "trading.cli.digest:main"
-tt-serve = "trading.cli.serve:main"
+trading-mcp = "trading.cli.serve:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

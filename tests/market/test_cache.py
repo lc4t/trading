@@ -342,3 +342,64 @@ def test_non_fetch_errors_are_reported_by_type_only(cache, fetcher, clock):
     clock.advance(seconds=700)
     payload = cache.get_range(SYM, D(2024, 6, 3), D(2024, 6, 5))
     assert payload["tail_refresh_error"] == "RuntimeError"
+
+
+# ------------------------------------------------------------------- 只读数据库
+def test_read_only_store_returns_cached_rows_and_reports_read_only_without_upstream_calls(
+    cache, store, fetcher, clock
+):
+    clock.now = cn_time(2024, 6, 6, 9, 0)
+    seed_upstream(fetcher, {D(2024, 6, 3): 1.0, D(2024, 6, 4): 1.1})
+    cache.get_range(SYM, D(2024, 6, 3), D(2024, 6, 4))
+    calls = len(fetcher.calls)
+
+    store.configure_read_only()
+    for refresh in ("always", "missing"):
+        clock.advance(seconds=900)  # 尾部检查也到期
+        payload = cache.get_range(SYM, D(2024, 6, 3), D(2024, 6, 6), refresh=refresh)
+        assert payload["count"] == 2 and payload["tail_refresh_error"] == "read_only"
+        assert payload["refreshed"] is False
+    latest = cache.get_latest(SYM, refresh="always")
+    assert latest["data"]["close_price"] == 1.1 and latest["tail_refresh_error"] == "read_only"
+    assert len(fetcher.calls) == calls  # 不写库就不回源
+
+
+def test_read_only_with_empty_cache_does_not_raise_in_cache_layer(cache, store):
+    store.configure_read_only()
+    payload = cache.get_range(SYM, D(2024, 6, 3), D(2024, 6, 4), refresh="always")
+    assert payload["count"] == 0 and payload["tail_refresh_error"] == "read_only"
+
+
+def test_privilege_error_at_runtime_switches_to_read_only(cache, store, fetcher, clock, monkeypatch):
+    from sqlalchemy.exc import OperationalError
+
+    clock.now = cn_time(2024, 6, 6, 9, 0)
+    seed_upstream(fetcher, {D(2024, 6, 3): 1.0})
+    cache.get_range(SYM, D(2024, 6, 3), D(2024, 6, 3))
+
+    from sqlalchemy.orm import Session, sessionmaker
+
+    class DeniedSession(Session):  # 模拟只读账号：任何写语句都被 MySQL 以 1142 拒绝
+        def execute(self, statement, *args, **kwargs):
+            if getattr(statement, "is_insert", False) or getattr(statement, "is_update", False):
+                raise OperationalError("INSERT", {}, Exception(1142, "INSERT command denied to user"))
+            return super().execute(statement, *args, **kwargs)
+
+    monkeypatch.setattr(store, "Session", sessionmaker(bind=store.engine, class_=DeniedSession))
+    seed_upstream(fetcher, {D(2024, 6, 3): 1.0, D(2024, 6, 4): 1.1})
+    clock.advance(seconds=900)
+    payload = cache.get_range(SYM, D(2024, 6, 3), D(2024, 6, 5))
+    assert payload["tail_refresh_error"] == "read_only" and payload["count"] == 1
+    assert store.read_only is True  # 之后不再尝试回源
+    n = len(fetcher.calls)
+    cache.get_range(SYM, D(2024, 6, 3), D(2024, 6, 5), refresh="always")
+    assert len(fetcher.calls) == n
+
+
+def test_read_only_service_raises_clear_no_data_error(cache, store):
+    from trading.market.service import MarketService, NoDataError
+
+    store.configure_read_only()
+    with pytest.raises(NoDataError) as exc:
+        MarketService(cache).price_history([SYM], D(2024, 6, 3), D(2024, 6, 4))
+    assert "read-only" in str(exc.value)

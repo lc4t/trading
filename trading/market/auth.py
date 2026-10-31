@@ -238,7 +238,7 @@ def _parse_entry(index: int, item: Any, names: set[str]) -> tuple[str, FrozenSet
         if not isinstance(plain, str) or len(plain) < MIN_PLAINTEXT_TOKEN_LENGTH:
             raise ConfigError(
                 f"{where}（{name}）的明文 token 至少 {MIN_PLAINTEXT_TOKEN_LENGTH} 个字符；"
-                "建议改用 sha256（tt-serve gen-token 生成）"
+                "建议改用 sha256（trading-mcp gen-token 生成）"
             )
         digest = hash_token(plain)  # 明文只在这里短暂存在，内存里只留哈希
     return name, frozenset(scopes), digest

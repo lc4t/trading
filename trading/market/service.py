@@ -107,10 +107,16 @@ class MarketService:
                 "corrected_rows": payload["corrected_rows"],
             }
         if not views:
+            hint = (
+                " (database is read-only: nothing cached and upstream refresh is disabled)"
+                if any(c["tail_refresh_error"] == "read_only" for c in cache_info.values())
+                else ""
+            )
             raise NoDataError(
                 "The market data service returned no rows for "
                 + ", ".join(symbols)
                 + f" in [{start.isoformat()}, {end.isoformat()}]"
+                + hint
             )
         views.sort(key=lambda v: (v["date"], v["symbol"]))
         return {
