@@ -68,12 +68,20 @@ class ServerConfig:
     allowed_hosts: tuple[str, ...] = ()
     config_dir: str = DEFAULT_CONFIG_DIR
     read_only: bool = False
+    text_content: str = "json"
     read_rate_per_min: int = 120
     refresh_rate_per_min: int = 10
     backtest_rate_per_min: int = 6
     backtest_concurrency: int = 2
     backtest_max_span_days: int = 3660
     backtest_max_symbols: int = 20
+
+
+def _text_mode(env: Mapping[str, str]) -> str:
+    mode = (env.get("MCP_TEXT_CONTENT") or "json").strip().lower()
+    if mode not in {"json", "summary"}:
+        raise ConfigError("MCP_TEXT_CONTENT 必须是 json 或 summary")
+    return mode
 
 
 def env_token_entries(env: Mapping[str, str]) -> tuple[list[str], list[str]]:
@@ -135,6 +143,7 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> ServerConfig:
         port=port,
         allowed_hosts=hosts,
         config_dir=env.get("MCP_CONFIG_DIR") or DEFAULT_CONFIG_DIR,
+        text_content=_text_mode(env),
         read_only=(env.get("MCP_READ_ONLY") or "").strip().lower() in {"1", "true", "yes", "on"},
         **extra,
     )

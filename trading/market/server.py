@@ -14,6 +14,7 @@ from typing import Any, Callable, Dict, List, Literal, Optional
 import anyio
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.types import CallToolResult, TextContent
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -27,6 +28,7 @@ from .auth import (
 )
 from .config import ServerConfig
 from .errors import FetchError, RequestError
+from . import timing
 from .service import MarketService, NoDataError
 
 logger = logging.getLogger("trading.market.server")
@@ -56,16 +58,50 @@ def _date(value: str) -> dt.date:
         raise ValueError("date must use YYYY-MM-DD") from exc
 
 
-async def _run(fn: Callable[..., Any], *args: Any) -> Any:
-    """在线程里跑同步业务代码；非预期异常对外只暴露统一信息，细节只进服务端日志."""
+SLOW_CALL_MS = 1000.0
+
+
+async def _run(fn: Callable[..., Any], *args: Any, label: Optional[str] = None) -> Any:
+    """在线程里跑同步业务代码，统计服务端耗时并随结果返回（dict 结果多一个 ``timing`` 字段）.
+
+    非预期异常对外只暴露统一信息，细节只进服务端日志.
+    """
+    stats = timing.CallStats()
+    token = timing.current.set(stats)
+    name = label or getattr(fn, "__name__", "tool")
     try:
-        return await anyio.to_thread.run_sync(lambda: fn(*args))
+        result = await anyio.to_thread.run_sync(lambda: fn(*args))
     except _PUBLIC_ERRORS:
         raise
     except Exception as exc:  # noqa: BLE001
-        # 对外只给统一信息；完整堆栈只进服务端日志（不含 token；SQL 参数是行情数据，不是密钥）
+        # 完整堆栈只进服务端日志（不含 token；SQL 参数是行情数据，不是密钥）
         logger.error("tool failed: %s", type(exc).__name__, exc_info=True)
         raise RuntimeError("internal error; see server logs") from None
+    finally:
+        timing.current.reset(token)
+        snap = stats.snapshot()
+        logger.info(
+            "tool=%s server_ms=%s db_ops=%s db_statements=%s db_ms=%s upstream_calls=%s upstream_ms=%s",
+            name, snap["server_ms"], snap["db_ops"], snap["db_statements"], snap["db_ms"],
+            snap["upstream_calls"], snap["upstream_ms"],
+        )
+        if snap["server_ms"] >= SLOW_CALL_MS and snap.get("symbols"):
+            slowest = sorted(snap["symbols"], key=lambda x: -x["ms"])[:5]
+            logger.info("tool=%s slow symbols (top5): %s", name, slowest)
+    if isinstance(result, dict):
+        result["timing"] = snap
+    return result
+
+
+def _package(payload: Any, mode: str) -> Any:
+    """structuredContent 是主载体；文本部分只留紧凑 JSON（默认）或一行摘要，避免响应体里同一份数据出现两次缩进版."""
+    if not isinstance(payload, dict):
+        return payload
+    if mode == "summary":
+        text = "ok; full result in structuredContent (count=%s)" % payload.get("count", "n/a")
+    else:
+        text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
+    return CallToolResult(content=[TextContent(type="text", text=text)], structuredContent=payload)
 
 
 def create_mcp(
@@ -94,6 +130,9 @@ def create_mcp(
         transport_security=security,
     )
 
+    async def run(fn: Callable[..., Any], *args: Any, label: Optional[str] = None) -> Any:
+        return _package(await _run(fn, *args, label=label), config.text_content)
+
     @mcp.tool()
     async def get_price_history(
         symbols: list[str],
@@ -108,8 +147,9 @@ def create_mcp(
         dividend-adjusted view (only for raw/split-adjusted series); default is the stored basis.
         refresh='always' requires the refresh scope.
         """
-        return await _run(
-            service.price_history, symbols, _date(start_date), _date(end_date), refresh, adjust
+        return await run(
+            service.price_history, symbols, _date(start_date), _date(end_date), refresh, adjust,
+            label="get_price_history",
         )
 
     @mcp.tool()
@@ -117,15 +157,16 @@ def create_mcp(
         symbol: str, refresh: RefreshPolicy = "missing", adjust: AdjustMode = "none"
     ) -> dict[str, Any]:
         """Return the newest cached daily row; this is not a real-time quote."""
-        return await _run(service.latest_price, symbol, refresh, adjust)
+        return await run(service.latest_price, symbol, refresh, adjust, label="get_latest_price")
 
     @mcp.tool()
     async def get_fund_nav_history(
         fund_code: str, start_date: str, end_date: str, refresh: RefreshPolicy = "missing"
     ) -> dict[str, Any]:
         """Return official unit-NAV history for a six-digit off-market fund."""
-        return await _run(
-            service.fund_nav_history, fund_code, _date(start_date), _date(end_date), refresh
+        return await run(
+            service.fund_nav_history, fund_code, _date(start_date), _date(end_date), refresh,
+            label="get_fund_nav_history",
         )
 
     @mcp.tool()
@@ -133,17 +174,20 @@ def create_mcp(
         fund_code: str, refresh: RefreshPolicy = "missing"
     ) -> dict[str, Any]:
         """Return the newest cached official unit NAV for one off-market fund."""
-        return await _run(service.latest_fund_nav, fund_code, refresh)
+        return await run(service.latest_fund_nav, fund_code, refresh, label="get_latest_fund_nav")
 
     @mcp.tool()
     async def refresh_fund_nav_cache(
         fund_code: str, start_date: str, end_date: str
     ) -> dict[str, Any]:
         """Fetch official unit NAV rows from upstream and record them in the cache (refresh scope)."""
-        return await _run(service.refresh_fund_nav, fund_code, _date(start_date), _date(end_date))
+        return await run(
+            service.refresh_fund_nav, fund_code, _date(start_date), _date(end_date),
+            label="refresh_fund_nav_cache",
+        )
 
     if backtests is not None:
-        backtests.register(mcp, _run)
+        backtests.register(mcp, run)
     return mcp
 
 

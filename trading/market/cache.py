@@ -32,6 +32,7 @@ from .errors import FetchError, ReadOnlyError, RequestError
 from .fetchers import RangePriceFetcher, series_type_for_symbol, upstream_route_for_symbol
 from .models import STABLE_BASES
 from .store import MarketStore
+from .timing import per_symbol, timed
 
 SYMBOL_PATTERN = re.compile(r"^[A-Z0-9^._=-]{1,20}$")
 OFF_MARKET_FUND_PATTERN = re.compile(r"^\d{6}$")
@@ -154,7 +155,8 @@ class MarketCache:
     # ------------------------------------------------------------------ fetch
     def _fetch_and_persist(self, symbol: str, start: date, end: date) -> tuple[Any, int]:
         mode = self.store.series_mode(symbol)
-        result = self.fetcher.fetch(symbol, start, end, mode=mode)
+        with timed("upstream"):
+            result = self.fetcher.fetch(symbol, start, end, mode=mode)
         rows = [r for r in result.rows if start <= r["date"] <= end]
         fetched_at = self._now()
         finals = {r["date"]: is_final_snapshot(symbol, r["date"], fetched_at) for r in rows}
@@ -211,6 +213,7 @@ class MarketCache:
         return outcome
 
     # ------------------------------------------------------------------ reads
+    @per_symbol
     def get_range(
         self,
         symbol: str,

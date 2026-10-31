@@ -187,6 +187,7 @@ result.plot()         # → matplotlib figure
 | `MCP_HOST` / `MCP_PORT` | 否 | 监听地址 / 端口。本机默认 `127.0.0.1:8765`；**镜像里默认 `0.0.0.0:8765`** |
 | `MCP_RATE_LIMIT_{READ,REFRESH,BACKTEST}_PER_MIN` | 否 | 每个 token 每分钟调用上限，默认 120 / 10 / 6 |
 | `MCP_BACKTEST_{CONCURRENCY,MAX_SPAN_DAYS,MAX_SYMBOLS}` | 否 | 回测并发 / 单次区间天数 / 标的数上限，默认 2 / 3660 / 20 |
+| `MCP_TEXT_CONTENT` | 否 | 响应里 `content` 文本部分：`json`（默认，紧凑 JSON）或 `summary`（一行摘要，数据只在 `structuredContent`，响应体约减半） |
 | `MCP_READ_ONLY` | 否 | 设为 `1` 强制只读模式（见下）；账号没有写权限时也会自动进入 |
 | `MCP_ALLOWED_HOSTS` | 否 | 逗号分隔的 Host 白名单；设置后启用 DNS-rebinding 防护 |
 
@@ -300,6 +301,24 @@ claude mcp add --transport http trading-market http://localhost:8765/mcp \
 回测工具（`backtest`，只读缓存里的日线、不回源、不画图；先用行情工具把数据备好）：
 `run_dual_ma_backtest`、`run_momentum_topn_backtest`、`run_momentum_basket_backtest`，入参对应 CLI / 前端表单，返回
 `metrics`、`trades`（最近 `trade_limit` 条）、`next_signal` 和每个标的的 `data_quality`（价格口径、末行是否已定稿）。
+
+### 服务端耗时（排查慢请求）
+
+每个工具的返回里带 `timing`（只做加法，不参与 `data_fingerprint`），同时每次调用写一行 INFO 日志：
+
+```
+tool=get_price_history server_ms=2310.4 db_ops=3 db_statements=3 db_ms=96.2 upstream_calls=1 upstream_ms=2105.7
+```
+
+| 字段 | 含义 |
+| ---- | ---- |
+| `server_ms` | 服务端总耗时（不含网络） |
+| `db_ops` / `db_ms` | 进入存储层的次数 / 累计毫秒，含建连、`pool_pre_ping`、提交/回滚的完整往返 |
+| `db_statements` | 实际执行的 SQL 条数 |
+| `upstream_calls` / `upstream_ms` | 回源次数 / 累计毫秒（东财、Yahoo 等） |
+| `symbols[]` | 逐标的的 `ms`、`db_ms`、`upstream_ms`、`refreshed`；总耗时 ≥ 1s 时日志里还会列出最慢的 5 个 |
+
+`db_ms` 很大而 `db_statements` 很少，说明是数据库往返慢（跨地域）；`upstream_ms` 大说明是回源（尾部检查每 10 分钟每个标的一次）。
 
 ### 缓存语义
 

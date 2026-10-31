@@ -214,3 +214,43 @@ def test_unexpected_tool_errors_return_generic_message_but_log_traceback(make_cl
     assert "secret-detail" not in result["content"][0]["text"]
     record = next(r for r in caplog.records if "tool failed" in r.getMessage())
     assert record.exc_info and record.exc_info[0] is KeyError  # 服务端日志里有完整堆栈
+
+
+def test_response_carries_server_timing_and_logs_it(make_client, fetcher, clock, caplog):
+    seed(fetcher, clock)
+    caplog.set_level(logging.INFO, logger="trading.market.server")
+    with make_client() as client:
+        out = call(client, READ_TOKEN, "get_price_history", {**ARGS, "symbols": ["159915.SZ"]}).json()["result"]
+    timing_info = out["structuredContent"]["timing"]
+    assert timing_info["server_ms"] > 0 and timing_info["db_ops"] >= 1 and timing_info["db_statements"] >= 1
+    assert timing_info["upstream_calls"] == 1 and timing_info["upstream_ms"] >= 0  # 首次要回源
+    assert timing_info["symbols"][0]["symbol"] == "159915.SZ" and timing_info["symbols"][0]["refreshed"] is True
+    line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("tool=get_price_history"))
+    assert "db_ms=" in line and "upstream_ms=" in line and READ_TOKEN not in caplog.text
+    with make_client() as client:  # 第二次命中缓存：不再回源
+        again = call(client, READ_TOKEN, "get_price_history", ARGS).json()["result"]["structuredContent"]["timing"]
+    assert again["upstream_calls"] == 0
+
+
+def test_text_content_is_compact_json_and_structured_content_is_primary(make_client, fetcher, clock):
+    seed(fetcher, clock)
+    with make_client() as client:
+        result = call(client, READ_TOKEN, "get_price_history", ARGS).json()["result"]
+    text = result["content"][0]["text"]
+    assert "\n" not in text and ": " not in text.split('"data"')[0]  # 紧凑 JSON，没有缩进版
+    assert json.loads(text) == result["structuredContent"]
+
+
+def test_summary_mode_keeps_only_a_one_line_text(make_client, fetcher, clock):
+    seed(fetcher, clock)
+    with make_client(MCP_TEXT_CONTENT="summary") as client:
+        result = call(client, READ_TOKEN, "get_price_history", ARGS).json()["result"]
+    assert result["content"][0]["text"].startswith("ok; full result in structuredContent")
+    assert result["structuredContent"]["count"] == 1
+
+
+def test_invalid_text_content_mode_rejected():
+    from trading.market.errors import ConfigError
+
+    with pytest.raises(ConfigError):
+        load_config(env(MCP_TEXT_CONTENT="xml"))

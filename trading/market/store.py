@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from ..data.repository import Base, TradingData
 from .clock import business_naive_now
 from .errors import ReadOnlyError
+from .timing import install_statement_counter, timed
 from .rows import PRICE_FIELDS, clean_rows
 from .models import (
     META_TABLES,
@@ -52,7 +53,8 @@ def retry_transient(fn):
     def wrapper(self, *args, **kwargs):
         for attempt in range(DB_RETRY_ATTEMPTS):
             try:
-                return fn(self, *args, **kwargs)
+                with timed("db"):
+                    return fn(self, *args, **kwargs)
             except DBAPIError as exc:
                 transient = _errno(exc) in TRANSIENT_ERRNOS or exc.connection_invalidated
                 if attempt == DB_RETRY_ATTEMPTS - 1 or not transient:
@@ -92,6 +94,7 @@ class MarketStore:
     def __init__(self, engine: Engine) -> None:
         self.engine = engine
         self.Session = sessionmaker(bind=engine)
+        install_statement_counter(engine)
         self._insert = _insert_for(engine)
         # 旁表建不出来（例如 DB 账号没有 DDL 权限）时降级为只写 trading_data，
         # 保证 tt-fetcher 每日同步不受影响；MCP 服务启动时则要求必须可用。

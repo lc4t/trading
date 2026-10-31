@@ -346,7 +346,8 @@ class BacktestTools:
                     threshold=threshold, schedule=schedule, cooldown_days=cooldown_days,
                     trend_filter_ma=trend_filter_ma, benchmark=benchmark,
                     risk_free_rate=risk_free_rate, trade_limit=trade_limit,
-                )
+                ),
+                label="run_momentum_basket_backtest"
             )
 
         @mcp.tool()
@@ -381,7 +382,8 @@ class BacktestTools:
                     threshold=threshold, schedule=schedule, cooldown_days=cooldown_days,
                     trend_filter_ma=trend_filter_ma, benchmark=benchmark,
                     risk_free_rate=risk_free_rate, trade_limit=trade_limit,
-                )
+                ),
+                label="run_momentum_topn_backtest"
             )
 
         @mcp.tool()
@@ -417,5 +419,6 @@ class BacktestTools:
                     chandelier_period=chandelier_period, chandelier_multiplier=chandelier_multiplier,
                     use_adr=use_adr, adr_period=adr_period, adr_multiplier=adr_multiplier,
                     benchmark=benchmark, risk_free_rate=risk_free_rate, trade_limit=trade_limit,
-                )
+                ),
+                label="run_dual_ma_backtest",
             )
