@@ -165,3 +165,36 @@ def test_single_backtest_runs_end_to_end_on_the_unified_store(store, db_client):
                 "trade_start_time": None, "trade_end_time": None, "benchmark": None, "risk_free_rate": 0.03},
     )
     assert result["initial_capital"] == 50000 and "metrics" in result and "next_signal" in result
+
+
+# ------------------------------------------------------------- 数据库瞬时故障重试
+def test_transient_db_errors_are_retried_but_others_are_not(store, monkeypatch):
+    from sqlalchemy.exc import OperationalError
+
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    store.upsert([make_row(SYM, D(2024, 6, 3), 1.0)], price_basis="raw")
+    real = store.Session
+    state = {"fail": 2}
+
+    def flaky(*a, **k):
+        if state["fail"]:
+            state["fail"] -= 1
+            raise OperationalError("SELECT", {}, Exception(1213, "Deadlock found"))
+        return real(*a, **k)
+
+    monkeypatch.setattr(store, "Session", flaky)
+    assert store.query_range(SYM, D(2024, 6, 1), D(2024, 6, 30))[0]["close_price"] == 1.0  # 第 3 次成功
+
+    state["fail"] = 5
+    with pytest.raises(OperationalError):
+        store.query_range(SYM, D(2024, 6, 1), D(2024, 6, 30))  # 超过重试次数照常抛出
+
+    def broken(*a, **k):
+        raise OperationalError("SELECT", {}, Exception(1064, "syntax error"))
+
+    monkeypatch.setattr(store, "Session", broken)
+    calls = []
+    monkeypatch.setattr("time.sleep", lambda s: calls.append(s))
+    with pytest.raises(OperationalError):
+        store.query_range(SYM, D(2024, 6, 1), D(2024, 6, 30))
+    assert calls == []  # 非瞬时错误不重试

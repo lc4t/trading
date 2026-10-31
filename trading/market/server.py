@@ -63,7 +63,8 @@ async def _run(fn: Callable[..., Any], *args: Any) -> Any:
     except _PUBLIC_ERRORS:
         raise
     except Exception as exc:  # noqa: BLE001
-        logger.error("tool failed: %s", type(exc).__name__)
+        # 对外只给统一信息；完整堆栈只进服务端日志（不含 token；SQL 参数是行情数据，不是密钥）
+        logger.error("tool failed: %s", type(exc).__name__, exc_info=True)
         raise RuntimeError("internal error; see server logs") from None
 
 

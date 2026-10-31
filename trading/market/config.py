@@ -53,6 +53,8 @@ class DatabaseConfig:
             echo=False,
             pool_pre_ping=True,
             pool_recycle=1800,
+            pool_size=10,
+            max_overflow=20,
             connect_args={"connect_timeout": 10, "read_timeout": 60, "write_timeout": 60},
         )
 

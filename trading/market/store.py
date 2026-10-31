@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import datetime as dt
+import functools
+import time
 from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
@@ -31,6 +33,34 @@ _QUANT = Decimal(f"0.{'0' * TradingData.STORAGE_SCALE}")
 EPOCH = dt.datetime(1970, 1, 1)
 # MySQL：1044/1142/1143/1227 = 库/表/列/操作权限不足，1290 = 服务器 --read-only
 PRIVILEGE_ERRNOS = frozenset({1044, 1142, 1143, 1227, 1290, 1370})
+
+
+# 1205 锁等待超时、1213 死锁、2002/2003/2006/2013 连接类瞬时故障：短暂重试即可恢复
+TRANSIENT_ERRNOS = frozenset({1205, 1213, 2002, 2003, 2006, 2013})
+DB_RETRY_ATTEMPTS = 3
+
+
+def _errno(exc: BaseException) -> Optional[int]:
+    args = getattr(getattr(exc, "orig", None), "args", ())
+    return args[0] if args and isinstance(args[0], int) else None
+
+
+def retry_transient(fn):
+    """数据库瞬时故障（死锁、断连）自动短重试；其它错误原样抛出。所有被包的方法都是幂等的."""
+
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        for attempt in range(DB_RETRY_ATTEMPTS):
+            try:
+                return fn(self, *args, **kwargs)
+            except DBAPIError as exc:
+                transient = _errno(exc) in TRANSIENT_ERRNOS or exc.connection_invalidated
+                if attempt == DB_RETRY_ATTEMPTS - 1 or not transient:
+                    raise
+                logger.warning(f"数据库瞬时故障（errno={_errno(exc)}），第 {attempt + 1} 次重试")
+                time.sleep(0.2 * (attempt + 1))
+
+    return wrapper
 
 
 def is_privilege_error(exc: BaseException) -> bool:
@@ -146,6 +176,7 @@ class MarketStore:
             .filter(TradingData.symbol == symbol)
         )
 
+    @retry_transient
     def query_range(self, symbol: str, start: dt.date, end: dt.date) -> List[Dict[str, Any]]:
         with self.Session() as session:
             if self.meta_enabled:
@@ -162,6 +193,7 @@ class MarketStore:
             )
             return [self._row_dict(d, None) for d in query.all()]
 
+    @retry_transient
     def query_latest(self, symbol: str) -> Optional[Dict[str, Any]]:
         with self.Session() as session:
             if self.meta_enabled:
@@ -179,12 +211,14 @@ class MarketStore:
             )
             return self._row_dict(data, None) if data else None
 
+    @retry_transient
     def first_date(self, symbol: str) -> Optional[dt.date]:
         with self.Session() as session:
             return session.query(func.min(TradingData.date)).filter(
                 TradingData.symbol == symbol
             ).scalar()
 
+    @retry_transient
     def series_mode(self, symbol: str) -> str:
         """该标的下一次写入应使用哪种抓取口径.
 
@@ -255,6 +289,7 @@ class MarketStore:
             return [(r.date, float(r.close_price)) for r in rows]
 
     # ----------------------------------------------------------------- writes
+    @retry_transient
     def upsert(
         self,
         rows: Sequence[Dict[str, Any]],
@@ -341,6 +376,7 @@ class MarketStore:
             return stmt.on_conflict_do_update(index_elements=index_elements, set_=update_cols)
         return stmt.on_duplicate_key_update(**update_cols)
 
+    @retry_transient
     def invalidate_before(self, symbol: str, before: dt.date) -> int:
         """让 ``before`` 之前的已缓存行失效：标记为非终值，下次读取会触发重抓.
 
@@ -358,6 +394,7 @@ class MarketStore:
             return result.rowcount or 0
 
     # ---------------------------------------------------------- corporate actions
+    @retry_transient
     def record_actions(
         self, symbol: str, actions: Iterable[Dict[str, Any]], detected_at: dt.datetime
     ) -> List[Dict[str, Any]]:
@@ -391,6 +428,7 @@ class MarketStore:
             session.commit()
         return new
 
+    @retry_transient
     def list_actions(self, symbol: str) -> List[Dict[str, Any]]:
         if not self.meta_enabled:
             return []

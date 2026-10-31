@@ -202,3 +202,15 @@ def test_required_scope_rules():
     assert required_scope(rpc("tools/call", {"name": "refresh_fund_nav_cache", "arguments": {}})) == "refresh"
     assert required_scope(rpc("tools/call", {"name": "run_dual_ma_backtest", "arguments": {}})) == "backtest"
     assert required_scope("garbage") is None
+
+
+def test_unexpected_tool_errors_return_generic_message_but_log_traceback(make_client, cache, caplog, monkeypatch):
+    seed_ok = None  # noqa: F841
+    monkeypatch.setattr(cache, "get_latest", lambda *a, **k: (_ for _ in ()).throw(KeyError("secret-detail")))
+    caplog.set_level(logging.ERROR)
+    with make_client() as client:
+        result = call(client, READ_TOKEN, "get_latest_price", {"symbol": "159915.SZ"}).json()["result"]
+    assert result["isError"] is True and "internal error" in result["content"][0]["text"]
+    assert "secret-detail" not in result["content"][0]["text"]
+    record = next(r for r in caplog.records if "tool failed" in r.getMessage())
+    assert record.exc_info and record.exc_info[0] is KeyError  # 服务端日志里有完整堆栈

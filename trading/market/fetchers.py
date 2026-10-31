@@ -29,6 +29,9 @@ EASTMONEY_FUND_NAV_URL = "https://api.fund.eastmoney.com/f10/lsjz"
 EASTMONEY_FUND_TREND_URL = "https://fund.eastmoney.com/pingzhongdata/{symbol}.js"
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 
+LONG_NAV_SPAN_DAYS = 1100  # 超过约 3 年的净值区间直接走 trend 脚本
+MAX_NAV_PAGES = 400  # lsjz 每页 49 条，约 19600 条
+
 FUND_NAV_SERIES = "fund_nav"
 MARKET_PRICE_SERIES = "market_price"
 
@@ -180,13 +183,20 @@ class RangePriceFetcher:
         """场外基金官方单位净值：先走净值接口，失败/为空再走历史趋势脚本."""
         import requests
 
+        # 跨度很长时 lsjz 要翻上百页（每页 49 条，串行），改成先走一次请求拿全量的 trend 脚本
+        if (end - start).days > LONG_NAV_SPAN_DAYS:
+            try:
+                return self._fund_trend(symbol, start, end, retry)
+            except FetchError:
+                pass
         headers = {
             "User-Agent": "trading-market/1.0",
             "Referer": f"https://fundf10.eastmoney.com/jjjz_{symbol}.html",
         }
         try:
             rows: List[Dict[str, Any]] = []
-            for page in range(1, 50):
+            complete = False
+            for page in range(1, MAX_NAV_PAGES + 1):
                 response = _request_with_retry(
                     requests.get,
                     EASTMONEY_FUND_NAV_URL,
@@ -206,6 +216,7 @@ class RangePriceFetcher:
                     raise FetchError("Eastmoney fund NAV response reported an error")
                 items = (payload.get("Data") or {}).get("LSJZList") or []
                 if not items:
+                    complete = True
                     break
                 observed: list[date] = []
                 for item in items:
@@ -218,8 +229,10 @@ class RangePriceFetcher:
                         rows.append(_nav_row(symbol, nav_date, float(raw_nav), item.get("JZZZL")))
                 # 接口返回的页数不可靠，按实际日期覆盖范围停止翻页
                 if observed and min(observed) <= start:
+                    complete = True
                     break
-            if rows:
+            # 翻到页数上限还没覆盖到 start 就是不完整，宁可回退也不返回被截断的结果
+            if rows and complete:
                 return FetchResult(
                     sorted(rows, key=lambda r: r["date"]), "eastmoney_fund_nav_api", "raw"
                 )

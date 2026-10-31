@@ -7,6 +7,7 @@ import adata
 import pandas as pd
 import pytest
 
+from trading.market import fetchers
 from trading.market.errors import FetchError
 from trading.market.fetchers import (
     REQUEST_RETRY,
@@ -169,4 +170,48 @@ def test_fund_nav_trend_fallback_uses_beijing_dates():
     with mock.patch("requests.get", side_effect=fake_get):
         result = RangePriceFetcher().fetch("005698", D(2024, 6, 1), D(2024, 6, 10))
     assert [r["date"] for r in result.rows] == [D(2024, 6, 4)]
+    assert result.source == "eastmoney_fund_nav_trend_fallback"
+
+
+def _fund_get(trend_points, lsjz_pages):
+    """lsjz 按页返回 lsjz_pages[page-1]；trend 脚本返回 trend_points。记录请求顺序。"""
+    calls = []
+
+    def fake_get(url, **kwargs):
+        response = mock.Mock()
+        response.raise_for_status.return_value = None
+        if "lsjz" in url:
+            page = kwargs["params"]["pageIndex"]
+            calls.append(f"lsjz{page}")
+            items = lsjz_pages[page - 1] if page <= len(lsjz_pages) else []
+            response.json.return_value = {"ErrCode": 0, "Data": {"LSJZList": items}}
+        else:
+            calls.append("trend")
+            response.text = "Data_netWorthTrend = " + json.dumps(trend_points) + ";"
+        return response
+
+    return fake_get, calls
+
+
+def _ts(day):
+    return int(dt.datetime(day.year, day.month, day.day, tzinfo=fetchers._SHANGHAI).timestamp() * 1000)
+
+
+def test_long_fund_range_goes_straight_to_the_single_request_trend_script():
+    points = [{"x": _ts(D(2010, 1, 4) + dt.timedelta(days=i)), "y": 1.0 + i / 1000, "equityReturn": 0.1} for i in range(5)]
+    fake_get, calls = _fund_get(points, [])
+    with mock.patch("requests.get", side_effect=fake_get):
+        result = RangePriceFetcher().fetch("005698", D(2004, 6, 16), D(2026, 10, 30))
+    assert calls == ["trend"] and len(result.rows) == 5
+
+
+def test_truncated_lsjz_is_never_returned_as_complete():
+    # 短区间，但接口一直有数据却翻不到 start（模拟页数上限）：必须回退 trend，而不是返回被截断的结果
+    one_page = [{"FSRQ": "2026-10-30", "DWJZ": "2.0", "JZZZL": "0.1"}]
+    fake_get, calls = _fund_get(
+        [{"x": _ts(D(2026, 9, 1)), "y": 1.5, "equityReturn": 0}], [one_page] * 1000
+    )
+    with mock.patch("requests.get", side_effect=fake_get), mock.patch.object(fetchers, "MAX_NAV_PAGES", 3):
+        result = RangePriceFetcher().fetch("005698", D(2026, 8, 1), D(2026, 10, 30))
+    assert calls[:3] == ["lsjz1", "lsjz2", "lsjz3"] and calls[-1] == "trend"
     assert result.source == "eastmoney_fund_nav_trend_fallback"
