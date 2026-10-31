@@ -180,25 +180,21 @@ result.plot()         # → matplotlib figure
 
 | 变量 | 必填 | 说明 |
 | ---- | ---- | ---- |
-| `DB_HOST` `DB_USER` `DB_PASSWORD` `DB_NAME` / `DB_PORT` | 是 | MySQL 连接，沿用现有变量；账号需要建表和读写权限 |
-| `MCP_TOKENS` 或 `MCP_TOKENS_FILE` | 是 | token 配置（见下），两者可同时用；都没有则启动失败 |
-| `MCP_HOST` / `MCP_PORT` | 否 | 监听地址 / 端口，默认 `127.0.0.1:8765`（镜像内默认 `0.0.0.0`） |
+| `DB_HOST` `DB_USER` `DB_PASSWORD` `DB_NAME` / `DB_PORT` | 是 | MySQL 连接，和每日流水线用同一组变量；账号需要建表和读写权限（云上 MySQL/CDB 同样只靠这几个变量） |
+| `MCP_TOKEN` | 否 | 单个 token（至少 24 字符），范围默认 `read`（`MCP_TOKEN_SCOPES` 可改） |
+| `MCP_TOKENS` / `MCP_TOKENS_FILE` | 否 | 多个 token（名字 + 范围 + sha256），见下 |
+| `MCP_CONFIG_DIR` | 否 | 自动生成/管理的 token 文件目录，镜像里默认 `/data/config`，**建议挂卷** |
+| `MCP_HOST` / `MCP_PORT` | 否 | 监听地址 / 端口。本机默认 `127.0.0.1:8765`；**镜像里默认 `0.0.0.0:8765`** |
 | `MCP_RATE_LIMIT_{READ,REFRESH,BACKTEST}_PER_MIN` | 否 | 每个 token 每分钟调用上限，默认 120 / 10 / 6 |
 | `MCP_BACKTEST_{CONCURRENCY,MAX_SPAN_DAYS,MAX_SYMBOLS}` | 否 | 回测并发 / 单次区间天数 / 标的数上限，默认 2 / 3660 / 20 |
 | `MCP_ALLOWED_HOSTS` | 否 | 逗号分隔的 Host 白名单；设置后启用 DNS-rebinding 防护 |
 
-缺 MySQL 配置、缺 token 配置、token 配置非法或数据库连不上时，服务**启动即失败**并打印原因（只写变量名，不回显值）。
-启动时自动建表（含元数据旁表）。
+缺 `DB_*`、配置非法或数据库连不上时，服务**启动即失败**并打印原因（只写变量名，不回显值）。启动时自动建表（含元数据旁表）。
 
-### 生成 token
+### 鉴权与 token
 
-服务端只保存 token 的 SHA-256；明文只在生成时出现一次，交给客户端保管：
-
-```bash
-uv run tt-serve gen-token --name agent-a --scopes read
-# 输出 token 以及形如 {"name":"agent-a","scopes":["read"],"sha256":"…"} 的配置条目
-export MCP_TOKENS='[{"name":"agent-a","scopes":["read"],"sha256":"…"}, {"name":"ops","scopes":["refresh","backtest"],"sha256":"…"}]'
-```
+鉴权**默认开启且无法关闭**，请求头 `Authorization: Bearer <token>`。服务端只保存 token 的 SHA-256，用常量时间比较；
+缺少或错误的 token → HTTP 401，权限不足 → 403，超过限流 → 429。日志里不会出现 token 或数据库密码，唯一的例外是下面「首次启动自动生成」时展示一次明文。
 
 | scope | 允许 |
 | ----- | ---- |
@@ -206,21 +202,46 @@ export MCP_TOKENS='[{"name":"agent-a","scopes":["read"],"sha256":"…"}, {"name"
 | `refresh` | 在 `read` 之外，允许 `refresh=always` 强制回源和 `refresh_fund_nav_cache`（按 token 限流，防止刷爆上游） |
 | `backtest` | 回测工具（独立 scope，不隐含 `read`；通常和 `read` 一起发） |
 
-缺少或错误的 token → HTTP 401；权限不足 → 403；超过限流 → 429。比较使用常量时间，日志不会出现 token 或 DB 密码。
+token 来源，按需组合：
+
+1. **什么都不配（最省事）**：首次启动自动生成一个 `read` token，在启动日志里用醒目的块**只显示这一次明文**，把哈希写入
+   `$MCP_CONFIG_DIR/tokens.json`（权限 0600，只存哈希）。之后重启不再显示。**一定要给 `/data/config` 挂卷**；
+   目录不可写时服务照常运行，但会明确警告「重启后 token 会变」。
+2. `MCP_TOKEN=…`：单个 token，范围默认 `read`。
+3. `MCP_TOKENS` / `MCP_TOKENS_FILE`：JSON 数组，每项 `{"name","scopes","sha256"}`，用 `tt-serve gen-token` 生成条目。
+
+```bash
+tt-serve token new --name ops --scopes read,refresh,backtest   # 新建（明文只显示这一次）
+tt-serve token rotate --name default                          # 轮换：旧 token 立即失效，范围不变
+tt-serve token list                                           # 只显示名字、范围、来源，不显示 token
+tt-serve gen-token --name agent-a --scopes read               # 不落盘，输出可放进 MCP_TOKENS 的条目
+```
+
+`token new|rotate` 修改的是配置目录里的文件，运行中的服务会自动加载，不用重启。容器里这样用：
+`docker exec trading-market /app/.venv/bin/tt-serve token new --name ops --scopes read,refresh`。
 
 ### 启动
 
 ```bash
-uv run tt-serve                      # 本机
-# 容器（同一个镜像；请显式用非 root 用户）
-docker run -d --name trading-market --user 10001:10001 -p 8765:8765 \
-  -e DB_HOST=… -e DB_USER=… -e DB_PASSWORD=… -e DB_NAME=trading \
-  -e MCP_TOKENS="$MCP_TOKENS" \
-  ghcr.io/lc4t/trading-2.0:latest /app/.venv/bin/tt-serve
+uv run tt-serve     # 本机（MCP_CONFIG_DIR 不可写时请先指到一个可写目录）
 ```
 
+容器（同一个镜像，请显式用非 root 用户，并把端口只绑到宿主的回环地址）：
+
+```bash
+docker run -d --name trading-market --user 10001:10001 \
+  -p 127.0.0.1:8765:8765 \
+  -v tt-config:/data/config \
+  -e DB_HOST=… -e DB_PORT=3306 -e DB_USER=… -e DB_PASSWORD=… -e DB_NAME=trading \
+  ghcr.io/lc4t/trading-2.0:latest /app/.venv/bin/tt-serve
+docker logs trading-market    # 首次启动会在这里显示自动生成的 token
+```
+
+- **监听地址**：容器内 `MCP_HOST` 默认 `0.0.0.0`。实测：容器里绑 `127.0.0.1` 时，即使加了 `-p 127.0.0.1:8765:8765`，宿主也访问不到（连接直接失败），只有容器内部能访问；
+  所以容器内必须监听 `0.0.0.0`，由宿主侧的 `-p` 决定对谁可见：
+  `-p 127.0.0.1:8765:8765` 只有宿主本机能连（实测经宿主局域网 IP 访问被拒），再由宿主上的反向代理/域名转发出去；确实要直接对外才用 `-p 8765:8765`（实测局域网可访问，此时务必妥善保管 token，并建议前置 TLS）。
 - 健康检查：`GET /healthz`，**不要求 token**，只返回 `{"status":"ok"}` / `{"status":"unavailable"}`（503），不带任何内部信息。镜像里的 `HEALTHCHECK` 只对 PID 1 是 `tt-serve` 的容器生效，每日流水线等一次性容器不受影响。
-- 镜像默认仍以 root 运行（每日流水线要往挂载的 `data/` 写文件）；服务请加 `--user 10001:10001`（镜像里已建好该用户）。
+- 镜像默认仍以 root 运行（每日流水线要往挂载的 `data/` 写文件）；服务请加 `--user 10001:10001`。`/data/config` 已归该用户所有，命名卷会继承；用绑定挂载时需要把目录 `chown 10001:10001`，否则会走「不可写」告警。
 - 服务本身不做 TLS，需要对外暴露时放在反向代理后面。
 
 ### 接入 MCP 客户端

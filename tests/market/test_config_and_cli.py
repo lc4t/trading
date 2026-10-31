@@ -26,15 +26,26 @@ def test_missing_mysql_config_fails_naming_variables_only():
     assert "DB_HOST" in message and "DB_PASSWORD" in message and "DB_NAME" in message
 
 
-def test_missing_token_config_refuses_to_run_unauthenticated():
-    with pytest.raises(ConfigError) as exc:
-        load_config(dict(DB))
-    assert "MCP_TOKENS" in str(exc.value)
+def test_no_token_config_loads_empty_registry_for_bootstrap(tmp_path):
+    config = load_config({**DB, "MCP_CONFIG_DIR": str(tmp_path)})
+    assert len(config.tokens) == 0  # 不会无鉴权运行：服务启动时由 bootstrap 生成 token
 
 
-def test_empty_token_list_is_rejected():
+def test_empty_token_list_counts_as_unconfigured(tmp_path):
+    assert len(load_config({**DB, "MCP_TOKENS": "[]", "MCP_CONFIG_DIR": str(tmp_path)}).tokens) == 0
+
+
+def test_single_mcp_token_defaults_to_read_scope(tmp_path):
+    config = load_config({**DB, "MCP_TOKEN": TOKEN, "MCP_CONFIG_DIR": str(tmp_path)})
+    principal = config.tokens.authenticate(TOKEN)
+    assert principal.name == "default" and principal.scopes == frozenset({"read"})
+    config = load_config({**DB, "MCP_TOKEN": TOKEN, "MCP_TOKEN_SCOPES": "refresh", "MCP_CONFIG_DIR": str(tmp_path)})
+    assert config.tokens.authenticate(TOKEN).allows("refresh")
+
+
+def test_short_mcp_token_rejected():
     with pytest.raises(ConfigError):
-        load_config({**DB, "MCP_TOKENS": "[]"})
+        load_config({**DB, "MCP_TOKEN": "short"})
 
 
 @pytest.mark.parametrize(
@@ -109,7 +120,7 @@ def test_rate_limiter_sliding_window():
 
 # ---------------------------------------------------------------- tt-serve 入口
 def clear_env(monkeypatch):
-    for key in ("DB_HOST", "DB_USER", "DB_PASSWORD", "DB_NAME", "MCP_TOKENS", "MCP_TOKENS_FILE"):
+    for key in ("DB_HOST", "DB_USER", "DB_PASSWORD", "DB_NAME", "MCP_TOKENS", "MCP_TOKENS_FILE", "MCP_TOKEN"):
         monkeypatch.delenv(key, raising=False)
 
 
@@ -119,7 +130,7 @@ def test_serve_fails_fast_without_config(monkeypatch, capsys):
         serve.main(["serve"])
     assert exc.value.code == 2
     err = capsys.readouterr().err
-    assert "配置错误" in err and "DB_HOST" in err and "MCP_TOKENS" in err
+    assert "配置错误" in err and "DB_HOST" in err
 
 
 def test_serve_default_command_also_fails_fast(monkeypatch, capsys):
@@ -129,10 +140,11 @@ def test_serve_default_command_also_fails_fast(monkeypatch, capsys):
     assert exc.value.code == 2
 
 
-def test_serve_fails_when_tokens_missing_even_if_db_configured(monkeypatch, capsys):
+def test_serve_config_errors_never_echo_secrets(monkeypatch, capsys):
     clear_env(monkeypatch)
     for k, v in DB.items():
         monkeypatch.setenv(k, v)
+    monkeypatch.setenv("MCP_TOKENS", "not json")
     with pytest.raises(SystemExit) as exc:
         serve.main(["serve"])
     assert exc.value.code == 2
@@ -161,3 +173,96 @@ def test_healthcheck_is_noop_for_non_server_containers(monkeypatch):
     with pytest.raises(SystemExit) as exc:
         serve.main(["healthcheck"])
     assert exc.value.code == 0
+
+
+# ------------------------------------------------- 配置目录 token 文件 / 自动引导 / token 子命令
+import os  # noqa: E402
+import stat  # noqa: E402
+
+from trading.market.auth import TokenStore, bootstrap_token  # noqa: E402
+
+
+def test_bootstrap_generates_persists_hash_only_and_shows_once(tmp_path):
+    config = load_config({**DB, "MCP_CONFIG_DIR": str(tmp_path)})
+    store = TokenStore(tmp_path)
+    boot = bootstrap_token(config.tokens, store)
+    assert boot.persisted and len(boot.token) >= 40
+    path = tmp_path / "tokens.json"
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+    content = path.read_text()
+    assert boot.token not in content and hash_token(boot.token).hex() in content  # 文件里只有哈希
+    assert config.tokens.authenticate(boot.token).scopes == frozenset({"read"})
+    # 重启：同一份配置目录，不再生成/展示
+    again = load_config({**DB, "MCP_CONFIG_DIR": str(tmp_path)})
+    assert bootstrap_token(again.tokens, TokenStore(tmp_path)) is None
+    assert again.tokens.authenticate(boot.token) is not None
+
+
+def test_bootstrap_with_env_token_does_nothing(tmp_path):
+    config = load_config({**DB, "MCP_TOKEN": TOKEN, "MCP_CONFIG_DIR": str(tmp_path)})
+    assert bootstrap_token(config.tokens, TokenStore(tmp_path)) is None
+    assert not (tmp_path / "tokens.json").exists()
+
+
+def test_bootstrap_with_unwritable_dir_falls_back_to_memory_and_flags_it(tmp_path):
+    blocker = tmp_path / "file"
+    blocker.write_text("x")  # 目录路径被一个普通文件占着 → 不可写
+    config = load_config({**DB, "MCP_CONFIG_DIR": str(blocker / "cfg")})
+    boot = bootstrap_token(config.tokens, TokenStore(blocker / "cfg"))
+    assert boot.persisted is False
+    assert config.tokens.authenticate(boot.token) is not None
+
+
+def test_registry_hot_reloads_token_file_changes(tmp_path):
+    config = load_config({**DB, "MCP_CONFIG_DIR": str(tmp_path)})
+    store = TokenStore(tmp_path)
+    assert config.tokens.authenticate("x" * 40) is None
+    new_token = store.add("ops", ["refresh"])
+    assert config.tokens.authenticate(new_token).allows("refresh")
+    rotated = store.rotate("ops")
+    assert config.tokens.authenticate(new_token) is None  # 旧 token 立即失效
+    assert config.tokens.authenticate(rotated).name == "ops"
+
+
+def test_token_store_rejects_duplicates_and_unknown_names(tmp_path):
+    store = TokenStore(tmp_path)
+    store.add("a", ["read"])
+    with pytest.raises(ConfigError):
+        store.add("a", ["read"])
+    with pytest.raises(ConfigError):
+        store.rotate("missing")
+    with pytest.raises(ConfigError):
+        store.add("b", ["root"])
+
+
+def test_token_cli_new_rotate_list(monkeypatch, tmp_path, capsys):
+    clear_env(monkeypatch)
+    monkeypatch.setenv("MCP_CONFIG_DIR", str(tmp_path))
+
+    def run(*argv):
+        with pytest.raises(SystemExit) as exc:
+            serve.main(list(argv))
+        return exc.value.code, capsys.readouterr()
+
+    code, out = run("token", "new", "--name", "ops", "--scopes", "read,refresh")
+    assert code == 0 and "ttm_" in out.out
+    first = next(x.strip() for x in out.out.splitlines() if x.strip().startswith("ttm_"))
+    code, out = run("token", "list")
+    assert code == 0 and "ops" in out.out and "refresh" in out.out and first not in out.out
+    code, out = run("token", "rotate", "--name", "ops")
+    second = next(x.strip() for x in out.out.splitlines() if x.strip().startswith("ttm_"))
+    assert code == 0 and second != first
+    assert run("token", "new", "--name", "ops")[0] == 2  # 重名
+    assert run("token", "new", "--name", "x", "--scopes", "root")[0] == 2
+
+
+def test_bootstrap_banner_marks_non_persistent_tokens(capsys):
+    from pathlib import Path
+
+    from trading.market.auth import Bootstrap
+
+    serve._announce_bootstrap(Bootstrap("ttm_example", False, Path("/data/config/tokens.json")))
+    err = capsys.readouterr().err
+    assert "重启后会变" in err and "ttm_example" in err
+    serve._announce_bootstrap(Bootstrap("ttm_example2", True, Path("/data/config/tokens.json")))
+    assert "重启不会再显示" in capsys.readouterr().err

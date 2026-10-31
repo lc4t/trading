@@ -1,6 +1,7 @@
 """服务配置：全部来自环境变量；缺失即启动失败，消息里只写变量名不回显值."""
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -10,7 +11,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.engine.url import URL
 
-from .auth import TokenRegistry
+from .auth import DEFAULT_CONFIG_DIR, TokenRegistry, TokenStore
 from .errors import ConfigError
 
 REQUIRED_DB_VARS = ("DB_HOST", "DB_USER", "DB_PASSWORD", "DB_NAME")
@@ -63,6 +64,7 @@ class ServerConfig:
     host: str = "127.0.0.1"
     port: int = 8765
     allowed_hosts: tuple[str, ...] = ()
+    config_dir: str = DEFAULT_CONFIG_DIR
     read_rate_per_min: int = 120
     refresh_rate_per_min: int = 10
     backtest_rate_per_min: int = 6
@@ -71,15 +73,14 @@ class ServerConfig:
     backtest_max_symbols: int = 20
 
 
-def load_config(env: Optional[Mapping[str, str]] = None) -> ServerConfig:
-    env = os.environ if env is None else env
-    problems: List[str] = []
-
-    missing = [key for key in REQUIRED_DB_VARS if not env.get(key)]
-    if missing:
-        problems.append("缺少 MySQL 配置: " + ", ".join(missing))
-
+def env_token_entries(env: Mapping[str, str]) -> tuple[list[str], list[str]]:
+    """收集环境变量/文件里显式配置的 token 文档；返回 (JSON 文档, 问题)。"""
     documents: List[str] = []
+    problems: List[str] = []
+    single = env.get("MCP_TOKEN")
+    if single:
+        scopes = [s.strip() for s in (env.get("MCP_TOKEN_SCOPES") or "read").split(",") if s.strip()]
+        documents.append(json.dumps([{"name": "default", "scopes": scopes, "token": single}]))
     if env.get("MCP_TOKENS"):
         documents.append(env["MCP_TOKENS"])
     token_file = env.get("MCP_TOKENS_FILE")
@@ -88,26 +89,35 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> ServerConfig:
             documents.append(Path(token_file).read_text(encoding="utf-8"))
         except OSError as exc:
             problems.append(f"无法读取 MCP_TOKENS_FILE（{type(exc).__name__}）")
-    if not documents and not token_file:
-        problems.append("缺少 token 配置: 请设置 MCP_TOKENS 或 MCP_TOKENS_FILE（拒绝无鉴权运行）")
+    return documents, problems
+
+
+def load_tokens(env: Mapping[str, str]) -> TokenRegistry:
+    """环境变量里的 token + 配置目录里的 token 文件。可能为空——服务启动时会自动引导生成。"""
+    documents, problems = env_token_entries(env)
     if problems:
         raise ConfigError("; ".join(problems))
+    store = TokenStore(env.get("MCP_CONFIG_DIR") or DEFAULT_CONFIG_DIR)
+    return TokenRegistry.from_json(*documents, store=store)
 
-    try:
-        tokens = TokenRegistry.from_json(*documents)
-        port = _int(env, "MCP_PORT", 8765, 1, 65535)
-        db_port = _int(env, "DB_PORT", 3306, 1, 65535)
-        extra = dict(
-            read_rate_per_min=_int(env, "MCP_RATE_LIMIT_READ_PER_MIN", 120, 1, 100000),
-            refresh_rate_per_min=_int(env, "MCP_RATE_LIMIT_REFRESH_PER_MIN", 10, 1, 100000),
-            backtest_rate_per_min=_int(env, "MCP_RATE_LIMIT_BACKTEST_PER_MIN", 6, 1, 100000),
-            backtest_concurrency=_int(env, "MCP_BACKTEST_CONCURRENCY", 2, 1, 32),
-            backtest_max_span_days=_int(env, "MCP_BACKTEST_MAX_SPAN_DAYS", 3660, 30, 36600),
-            backtest_max_symbols=_int(env, "MCP_BACKTEST_MAX_SYMBOLS", 20, 1, 200),
-        )
-    except ConfigError as exc:
-        raise ConfigError(str(exc)) from None
 
+def load_config(env: Optional[Mapping[str, str]] = None) -> ServerConfig:
+    env = os.environ if env is None else env
+    missing = [key for key in REQUIRED_DB_VARS if not env.get(key)]
+    if missing:
+        raise ConfigError("缺少 MySQL 配置: " + ", ".join(missing))
+
+    tokens = load_tokens(env)
+    port = _int(env, "MCP_PORT", 8765, 1, 65535)
+    db_port = _int(env, "DB_PORT", 3306, 1, 65535)
+    extra = dict(
+        read_rate_per_min=_int(env, "MCP_RATE_LIMIT_READ_PER_MIN", 120, 1, 100000),
+        refresh_rate_per_min=_int(env, "MCP_RATE_LIMIT_REFRESH_PER_MIN", 10, 1, 100000),
+        backtest_rate_per_min=_int(env, "MCP_RATE_LIMIT_BACKTEST_PER_MIN", 6, 1, 100000),
+        backtest_concurrency=_int(env, "MCP_BACKTEST_CONCURRENCY", 2, 1, 32),
+        backtest_max_span_days=_int(env, "MCP_BACKTEST_MAX_SPAN_DAYS", 3660, 30, 36600),
+        backtest_max_symbols=_int(env, "MCP_BACKTEST_MAX_SYMBOLS", 20, 1, 200),
+    )
     hosts = tuple(h.strip() for h in env.get("MCP_ALLOWED_HOSTS", "").split(",") if h.strip())
     return ServerConfig(
         database=DatabaseConfig(
@@ -121,5 +131,6 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> ServerConfig:
         host=env.get("MCP_HOST") or "127.0.0.1",
         port=port,
         allowed_hosts=hosts,
+        config_dir=env.get("MCP_CONFIG_DIR") or DEFAULT_CONFIG_DIR,
         **extra,
     )
