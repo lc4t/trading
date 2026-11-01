@@ -8,7 +8,7 @@ import pandas as pd
 import pytest
 
 from trading.market import fetchers
-from trading.market.errors import FetchError
+from trading.market.errors import FetchError, RateLimited
 from trading.market.fetchers import (
     REQUEST_RETRY,
     SYNC_RETRY,
@@ -87,25 +87,63 @@ def test_yahoo_legacy_matches_historical_call_signature():
     assert result.price_basis == "yahoo_adjusted" and result.actions == []
 
 
-def test_rate_limit_retry_is_short_and_bounded_on_request_path():
+def test_yahoo_rate_limit_on_request_path_gives_up_immediately_without_retrying():
     from yfinance.exceptions import YFRateLimitError
 
-    FakeTicker.errors = [YFRateLimitError(), YFRateLimitError(), YFRateLimitError()]
+    FakeTicker.errors = [YFRateLimitError(), YFRateLimitError()]
     with mock.patch("time.sleep") as sleep:
-        with pytest.raises(FetchError) as exc:
+        with pytest.raises(RateLimited) as exc:
             RangePriceFetcher().fetch("AAPL", D(2024, 6, 3), D(2024, 6, 5))
-    assert "YFRateLimitError" in str(exc.value)
-    assert len(FakeTicker.calls) == REQUEST_RETRY.attempts == 2
-    assert sum(c.args[0] for c in sleep.call_args_list) <= 1.0  # 请求路径不会长时间 sleep
+    assert exc.value.source == "yahoo" and exc.value.retry_after >= 1
+    assert len(FakeTicker.calls) == 1  # 命中限流不再重试（重试只会加重封禁）
+    sleep.assert_not_called()
 
 
-def test_rate_limit_then_success():
+def test_other_yahoo_errors_are_not_retried_and_stay_plain_fetch_errors():
+    FakeTicker.errors = [ValueError("bad")]
+    with pytest.raises(FetchError) as exc:
+        RangePriceFetcher().fetch("AAPL", D(2024, 6, 3), D(2024, 6, 5))
+    assert not isinstance(exc.value, RateLimited) and len(FakeTicker.calls) == 1
+
+
+def test_batch_sync_still_retries_rate_limits_with_long_backoff():
     from yfinance.exceptions import YFRateLimitError
 
     FakeTicker.errors = [YFRateLimitError()]
-    with mock.patch("time.sleep"):
-        result = RangePriceFetcher().fetch("AAPL", D(2024, 6, 3), D(2024, 6, 5))
-    assert len(result.rows) == 2
+    with mock.patch("time.sleep") as sleep:
+        result = RangePriceFetcher().fetch_yahoo("AAPL", D(2024, 6, 3), D(2024, 6, 5), retry=SYNC_RETRY)
+    assert len(result.rows) == 2 and sleep.call_args.args[0] == 30
+
+
+def test_request_retry_backoff_has_jitter_and_is_bounded():
+    delays = {round(REQUEST_RETRY.delay(0), 3) for _ in range(20)}
+    assert len(delays) > 1 and all(0.4 <= d <= 0.8 for d in delays)
+
+
+def test_http_429_becomes_rate_limited_with_retry_after_header():
+    response = mock.Mock(status_code=429, headers={"Retry-After": "90"})
+    error = __import__("requests").HTTPError(response=response)
+    response.raise_for_status.side_effect = error
+    with mock.patch("requests.get", return_value=response) as get:
+        with pytest.raises(RateLimited) as exc:
+            RangePriceFetcher().fetch("513100.SS", D(2024, 6, 3), D(2024, 6, 4))
+    assert exc.value.retry_after == 90 and get.call_count == 1
+
+
+def test_http_429_on_fund_api_is_not_swallowed_by_the_trend_fallback():
+    response = mock.Mock(status_code=429, headers={})
+    response.raise_for_status.side_effect = __import__("requests").HTTPError(response=response)
+    with mock.patch("requests.get", return_value=response) as get:
+        with pytest.raises(RateLimited):
+            RangePriceFetcher().fetch("005698", D(2024, 6, 1), D(2024, 6, 10))
+    assert get.call_count == 1
+
+
+def test_ths_ip_limit_is_a_rate_limit():
+    with mock.patch.object(adata.fund.market, "get_market_etf", return_value=Exception("ip limit")):
+        with pytest.raises(RateLimited) as exc:
+            RangePriceFetcher().fetch("159915.SZ", D(2024, 6, 1), D(2024, 6, 5), mode="legacy")
+    assert exc.value.source == "ths"
 
 
 def test_batch_sync_keeps_historical_long_backoff_policy():
@@ -126,12 +164,6 @@ def test_ths_legacy_rows_match_historical_adata_fetcher():
     row = result.rows[0]
     assert row["date"] == D(2024, 6, 3) and row["close_price"] == 1.1 and row["volume"] == 1000
     assert row["amount"] is None and row["change"] == 0.1 and row["change_pct"] is None
-
-
-def test_ths_ip_limit_exception_object_becomes_fetch_error():
-    with mock.patch.object(adata.fund.market, "get_market_etf", return_value=Exception("limit")):
-        with pytest.raises(FetchError):
-            RangePriceFetcher().fetch("159915.SZ", D(2024, 6, 1), D(2024, 6, 5), mode="legacy")
 
 
 def test_eastmoney_exchange_parses_raw_klines_and_asks_for_fqt0():

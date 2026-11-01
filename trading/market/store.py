@@ -16,6 +16,7 @@ from loguru import logger
 from sqlalchemy import and_, func, text, update
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError, SQLAlchemyError
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from sqlalchemy.orm import Session, sessionmaker
 
 from ..data.repository import Base, TradingData
@@ -28,6 +29,7 @@ from .models import (
     STABLE_BASES,
     MarketCorporateAction,
     MarketDataMeta,
+    MarketUpstreamState,
 )
 
 _QUANT = Decimal(f"0.{'0' * TradingData.STORAGE_SCALE}")
@@ -55,11 +57,12 @@ def retry_transient(fn):
             try:
                 with timed("db"):
                     return fn(self, *args, **kwargs)
-            except DBAPIError as exc:
-                transient = _errno(exc) in TRANSIENT_ERRNOS or exc.connection_invalidated
+            except (DBAPIError, PoolTimeoutError) as exc:
+                # 连接池取连接超时（突发并发占满连接）同样是瞬时的
+                transient = isinstance(exc, PoolTimeoutError) or _errno(exc) in TRANSIENT_ERRNOS or exc.connection_invalidated
                 if attempt == DB_RETRY_ATTEMPTS - 1 or not transient:
                     raise
-                logger.warning(f"数据库瞬时故障（errno={_errno(exc)}），第 {attempt + 1} 次重试")
+                logger.warning(f"数据库瞬时故障（{type(exc).__name__} errno={_errno(exc)}），第 {attempt + 1} 次重试")
                 time.sleep(0.2 * (attempt + 1))
 
     return wrapper
@@ -91,10 +94,14 @@ def _insert_for(engine: Engine):
 
 
 class MarketStore:
-    def __init__(self, engine: Engine) -> None:
+    def __init__(self, engine: Engine, read_engine: Optional[Engine] = None) -> None:
         self.engine = engine
+        self.read_engine = read_engine or engine
         self.Session = sessionmaker(bind=engine)
+        self.ReadSession = sessionmaker(bind=self.read_engine)
         install_statement_counter(engine)
+        if self.read_engine is not engine:
+            install_statement_counter(self.read_engine)
         self._insert = _insert_for(engine)
         # 旁表建不出来（例如 DB 账号没有 DDL 权限）时降级为只写 trading_data，
         # 保证 tt-fetcher 每日同步不受影响；MCP 服务启动时则要求必须可用。
@@ -181,7 +188,7 @@ class MarketStore:
 
     @retry_transient
     def query_range(self, symbol: str, start: dt.date, end: dt.date) -> List[Dict[str, Any]]:
-        with self.Session() as session:
+        with self.ReadSession() as session:
             if self.meta_enabled:
                 query = (
                     self._joined_query(session, symbol)
@@ -198,7 +205,7 @@ class MarketStore:
 
     @retry_transient
     def query_latest(self, symbol: str) -> Optional[Dict[str, Any]]:
-        with self.Session() as session:
+        with self.ReadSession() as session:
             if self.meta_enabled:
                 pair = (
                     self._joined_query(session, symbol)
@@ -216,7 +223,7 @@ class MarketStore:
 
     @retry_transient
     def first_date(self, symbol: str) -> Optional[dt.date]:
-        with self.Session() as session:
+        with self.ReadSession() as session:
             return session.query(func.min(TradingData.date)).filter(
                 TradingData.symbol == symbol
             ).scalar()
@@ -229,7 +236,7 @@ class MarketStore:
         - ``legacy``：存在遗留行（无元数据）或前复权/Yahoo 调整口径的行；沿用与历史一致的
           抓取方式，避免同一条序列里混入两种价格口径。
         """
-        with self.Session() as session:
+        with self.ReadSession() as session:
             total = session.query(func.count()).select_from(TradingData).filter(
                 TradingData.symbol == symbol
             ).scalar()
@@ -257,7 +264,7 @@ class MarketStore:
 
     def ohlcv_frame(self, symbol: str, start: Any, end: Any) -> pd.DataFrame:
         """回测引擎取数：与历史上 ``fetch_symbol_data`` 返回的 DataFrame 完全一致."""
-        with self.Session() as session:
+        with self.ReadSession() as session:
             df = pd.read_sql(
                 session.query(TradingData)
                 .filter(
@@ -278,7 +285,7 @@ class MarketStore:
 
     def close_series(self, symbol: str, start: Any, end: Any) -> List[Any]:
         """基准日收益用：[(date, close_price)]，按日期升序."""
-        with self.Session() as session:
+        with self.ReadSession() as session:
             rows = (
                 session.query(TradingData)
                 .filter(
@@ -396,6 +403,41 @@ class MarketStore:
             session.commit()
             return result.rowcount or 0
 
+    # ----------------------------------------------------------- upstream cooldown
+    @retry_transient
+    def load_cooldowns(self) -> Dict[str, tuple]:
+        if not self.meta_enabled:
+            return {}
+        with self.ReadSession() as session:
+            return {
+                r.source: (r.cooldown_until, int(r.failures))
+                for r in session.query(MarketUpstreamState).all()
+            }
+
+    def save_cooldown(self, source: str, until: dt.datetime, failures: int) -> None:
+        if not self.meta_enabled or self.read_only:
+            return
+        now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+        stmt = self._insert(MarketUpstreamState.__table__).values(
+            source=source, cooldown_until=until, failures=failures, updated_at=now
+        )
+        ref = stmt.excluded if self.engine.dialect.name == "sqlite" else stmt.inserted
+        stmt = self._apply_conflict(
+            stmt,
+            {"cooldown_until": ref.cooldown_until, "failures": ref.failures, "updated_at": ref.updated_at},
+            ["source"],
+        )
+        with self._writing(), self.Session() as session:
+            session.execute(stmt)
+            session.commit()
+
+    def clear_cooldown(self, source: str) -> None:
+        if not self.meta_enabled or self.read_only:
+            return
+        with self._writing(), self.Session() as session:
+            session.query(MarketUpstreamState).filter(MarketUpstreamState.source == source).delete()
+            session.commit()
+
     # ---------------------------------------------------------- corporate actions
     @retry_transient
     def record_actions(
@@ -435,7 +477,7 @@ class MarketStore:
     def list_actions(self, symbol: str) -> List[Dict[str, Any]]:
         if not self.meta_enabled:
             return []
-        with self.Session() as session:
+        with self.ReadSession() as session:
             return [
                 {"ex_date": a.ex_date, "kind": a.kind, "value": float(a.value)}
                 for a in session.query(MarketCorporateAction)
@@ -445,6 +487,8 @@ class MarketStore:
 
     def close(self) -> None:
         self.engine.dispose()
+        if self.read_engine is not self.engine:
+            self.read_engine.dispose()
 
 
 class _WriteGuard:

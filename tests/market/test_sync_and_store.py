@@ -173,7 +173,7 @@ def test_transient_db_errors_are_retried_but_others_are_not(store, monkeypatch):
 
     monkeypatch.setattr("time.sleep", lambda *_: None)
     store.upsert([make_row(SYM, D(2024, 6, 3), 1.0)], price_basis="raw")
-    real = store.Session
+    real = store.ReadSession
     state = {"fail": 2}
 
     def flaky(*a, **k):
@@ -182,7 +182,7 @@ def test_transient_db_errors_are_retried_but_others_are_not(store, monkeypatch):
             raise OperationalError("SELECT", {}, Exception(1213, "Deadlock found"))
         return real(*a, **k)
 
-    monkeypatch.setattr(store, "Session", flaky)
+    monkeypatch.setattr(store, "ReadSession", flaky)
     assert store.query_range(SYM, D(2024, 6, 1), D(2024, 6, 30))[0]["close_price"] == 1.0  # 第 3 次成功
 
     state["fail"] = 5
@@ -192,9 +192,26 @@ def test_transient_db_errors_are_retried_but_others_are_not(store, monkeypatch):
     def broken(*a, **k):
         raise OperationalError("SELECT", {}, Exception(1064, "syntax error"))
 
-    monkeypatch.setattr(store, "Session", broken)
+    monkeypatch.setattr(store, "ReadSession", broken)
     calls = []
     monkeypatch.setattr("time.sleep", lambda s: calls.append(s))
     with pytest.raises(OperationalError):
         store.query_range(SYM, D(2024, 6, 1), D(2024, 6, 30))
     assert calls == []  # 非瞬时错误不重试
+
+
+def test_pool_timeout_is_treated_as_transient(store, monkeypatch):
+    from sqlalchemy.exc import TimeoutError as PoolTimeout
+
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    store.upsert([make_row(SYM, D(2024, 6, 3), 1.0)], price_basis="raw")
+    real, state = store.ReadSession, {"fail": 1}
+
+    def exhausted(*a, **k):
+        if state["fail"]:
+            state["fail"] -= 1
+            raise PoolTimeout("QueuePool limit of size 10 overflow 20 reached")
+        return real(*a, **k)
+
+    monkeypatch.setattr(store, "ReadSession", exhausted)
+    assert store.query_range(SYM, D(2024, 6, 1), D(2024, 6, 30))[0]["close_price"] == 1.0

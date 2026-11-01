@@ -5,7 +5,7 @@
 """
 from __future__ import annotations
 
-from sqlalchemy import DATETIME, DECIMAL, Boolean, Column, Date, String
+from sqlalchemy import DATETIME, DECIMAL, Boolean, Column, Date, Integer, String
 
 from ..data.repository import Base
 
@@ -40,4 +40,21 @@ class MarketCorporateAction(Base):
     __table_args__ = ({"mysql_engine": "InnoDB", "mysql_charset": "utf8mb4"},)
 
 
-META_TABLES = (MarketDataMeta.__table__, MarketCorporateAction.__table__)
+class MarketUpstreamState(Base):
+    """上游来源的冷却状态：重启/多实例后限流冷却仍然生效."""
+
+    __tablename__ = "market_upstream_state"
+
+    source = Column(String(32), primary_key=True)
+    cooldown_until = Column(DATETIME, nullable=False, comment="冷却截止(UTC)")
+    failures = Column(Integer, nullable=False, default=0, comment="连续触发限流次数")
+    updated_at = Column(DATETIME, nullable=False, comment="更新时刻(UTC)")
+
+    __table_args__ = ({"mysql_engine": "InnoDB", "mysql_charset": "utf8mb4"},)
+
+
+META_TABLES = (
+    MarketDataMeta.__table__,
+    MarketCorporateAction.__table__,
+    MarketUpstreamState.__table__,
+)

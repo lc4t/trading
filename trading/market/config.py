@@ -38,8 +38,8 @@ class DatabaseConfig:
     password: str = field(repr=False)
     name: str
 
-    def create_engine(self) -> Engine:
-        url = URL.create(
+    def _url(self) -> URL:
+        return URL.create(
             drivername="mysql+pymysql",
             username=self.user,
             password=self.password,
@@ -48,14 +48,53 @@ class DatabaseConfig:
             database=self.name,
             query={"charset": "utf8mb4"},
         )
+
+    _CONNECT_ARGS = {"connect_timeout": 10, "read_timeout": 60, "write_timeout": 60}
+
+    def create_engine(self, pre_ping: bool = False) -> Engine:
+        """写连接池。``pre_ping`` 默认关：每次取连接的 ping 是一个多余的往返，
+        断连由存储层对幂等操作的瞬时故障重试兜底（连接池 1800s 回收也早于云库的 wait_timeout）。"""
         return create_engine(
-            url,
+            self._url(),
             echo=False,
-            pool_pre_ping=True,
+            pool_pre_ping=pre_ping,
             pool_recycle=1800,
             pool_size=10,
             max_overflow=20,
-            connect_args={"connect_timeout": 10, "read_timeout": 60, "write_timeout": 60},
+            connect_args=self._CONNECT_ARGS,
+        )
+
+    def create_read_engine(self) -> Engine:
+        """只读连接池：AUTOCOMMIT 连接，``rollback()`` 是空操作——一次读只剩 1 个 SELECT 往返
+        （原来是 ping + SELECT + ROLLBACK 等共 4 个）。autocommit 下没有事务可回滚，所以安全。"""
+        import pymysql
+
+        class _AutocommitConnection(pymysql.connections.Connection):
+            def rollback(self):  # SQLAlchemy 在归还连接时必发的 ROLLBACK，autocommit 下纯属浪费一个往返
+                return None
+
+        def connect():
+            return _AutocommitConnection(
+                host=self.host,
+                port=self.port,
+                user=self.user,
+                password=self.password,
+                database=self.name,
+                charset="utf8mb4",
+                autocommit=True,
+                **self._CONNECT_ARGS,
+            )
+
+        return create_engine(
+            "mysql+pymysql://",
+            creator=connect,
+            echo=False,
+            isolation_level="AUTOCOMMIT",
+            pool_reset_on_return=None,
+            pool_pre_ping=False,
+            pool_recycle=1800,
+            pool_size=10,
+            max_overflow=20,
         )
 
 
