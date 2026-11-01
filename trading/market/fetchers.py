@@ -333,7 +333,8 @@ class RangePriceFetcher:
             YFRateLimitError = ()  # type: ignore[assignment]
 
         if legacy:
-            kwargs: Dict[str, Any] = {"start": start, "end": end, "actions": False}
+            # 价格口径与历史完全一致（auto_adjust 默认 True）；多要分红/拆股事件，用来判断何时必须整段重写
+            kwargs: Dict[str, Any] = {"start": start, "end": end, "actions": True}
         else:
             kwargs = {
                 "start": start,
@@ -369,6 +370,12 @@ class RangePriceFetcher:
             trade_date = index.date()
             if not start <= trade_date <= end:
                 continue
+            dividend = _number(record.get("Dividends", 0))
+            split = _number(record.get("Stock Splits", 0))
+            if dividend:
+                actions.append({"ex_date": trade_date, "kind": "dividend", "value": dividend})
+            if split:
+                actions.append({"ex_date": trade_date, "kind": "split", "value": split})
             o, c = _number(record["Open"]), _number(record["Close"])
             h, lo = _number(record["High"]), _number(record["Low"])
             if None in {o, c, h, lo}:
@@ -389,15 +396,8 @@ class RangePriceFetcher:
                     "change_pct": None,
                 }
             )
-            if not legacy:
-                dividend = _number(record.get("Dividends", 0))
-                split = _number(record.get("Stock Splits", 0))
-                if dividend:
-                    actions.append({"ex_date": trade_date, "kind": "dividend", "value": dividend})
-                if split:
-                    actions.append({"ex_date": trade_date, "kind": "split", "value": split})
         if legacy:
-            return FetchResult(rows, "yahoo_auto_adjust", "yahoo_adjusted")
+            return FetchResult(rows, "yahoo_auto_adjust", "yahoo_adjusted", actions=actions)
         return FetchResult(rows, "yahoo_unadjusted", "split_adjusted", actions=actions)
 
 

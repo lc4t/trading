@@ -8,6 +8,7 @@ import tenacity
 from loguru import logger
 import traceback
 from .repository import DBClient
+from ..market import corporate
 from ..market.clock import as_of_for, is_final_snapshot, utcnow
 from ..market.fetchers import SYNC_RETRY, FetchResult, RangePriceFetcher, ths_etf_rows
 from ..market.store import MarketStore
@@ -84,6 +85,7 @@ class StockDataManager:
         self.market_store = MarketStore(self.db_client.engine)
         self.market_store.ensure_meta_tables()
         self._results: Dict[str, FetchResult] = {}
+        self._pending_actions: Dict[str, List[Dict[str, Any]]] = {}
 
     @staticmethod
     def count_trading_days(start_date, end_date) -> int:
@@ -119,6 +121,21 @@ class StockDataManager:
             symbol, start_date, end_date, mode=mode, retry=SYNC_RETRY
         )
         self._results[symbol] = result
+        if result.price_basis in ("yahoo_adjusted", "split_adjusted"):
+            # 复权口径下，新的分红/拆股会让此前所有行整体平移；只重写窗口会在窗口起点留下接缝，
+            # 所以检测到新的公司行动时，把该标的整段历史一起重写（首次检测只建基线，不触发）
+            verdict = corporate.assess(self.market_store, symbol, result, utcnow())
+            first = self.market_store.first_date(symbol)
+            window_start = start_date.date() if isinstance(start_date, datetime) else start_date
+            if verdict.trigger and first is not None and first < window_start:
+                logger.warning(
+                    f"{symbol} 检测到新的公司行动 {[(a['kind'], str(a['ex_date'])) for a in verdict.new]}，"
+                    f"整段历史重写（{first} 至 {end_date}）"
+                )
+                result = self.market_fetcher.fetch(symbol, first, end_date, mode=mode, retry=SYNC_RETRY)
+                result.actions = verdict.new
+                self._results[symbol] = result
+            self._pending_actions[symbol] = verdict.new
         data = result.rows
 
         if data:
@@ -159,6 +176,9 @@ class StockDataManager:
             return False
         if not written:
             logger.error("清洗后没有可写入的数据（全部记录都缺失开高低收）")
+        else:
+            # 写成功才记录新事件：写失败的话下次同步仍会判定为「新」，继续重试整段重写
+            corporate.commit(self.market_store, symbol, self._pending_actions.pop(symbol, []), utcnow())
         return written > 0
 
     def fetch_data(

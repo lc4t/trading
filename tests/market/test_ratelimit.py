@@ -193,7 +193,21 @@ def test_mixed_request_returns_cached_symbol_and_flags_the_limited_one(stack, cl
 
 
 # ------------------------------------------------------------ single-flight
-def test_concurrent_refreshes_of_one_symbol_are_coalesced(store, clock):
+@pytest.fixture
+def file_store(tmp_path):
+    """多线程测试用文件库 + 连接池（内存库的 StaticPool 只有一条连接，线程间共用不安全）。"""
+    from sqlalchemy import create_engine
+
+    from trading.market.store import MarketStore
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'sf.db'}", connect_args={"check_same_thread": False})
+    s = MarketStore(engine)
+    s.init_schema()
+    return s
+
+
+def test_concurrent_refreshes_of_one_symbol_are_coalesced(file_store, clock):
+    store = file_store
     gate = threading.Event()
 
     class SlowFetcher(FakeFetcher):
@@ -220,7 +234,8 @@ def test_concurrent_refreshes_of_one_symbol_are_coalesced(store, clock):
     assert len(fetcher.calls) == 1  # 8 个并发的 always 只打了一次上游
 
 
-def test_followers_share_leader_failure_without_extra_upstream_calls(store, clock):
+def test_followers_share_leader_failure_without_extra_upstream_calls(file_store, clock):
+    store = file_store
     gate = threading.Event()
 
     class FailingFetcher(FakeFetcher):

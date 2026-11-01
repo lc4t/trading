@@ -83,7 +83,7 @@ def test_yahoo_legacy_matches_historical_call_signature():
     result = RangePriceFetcher().fetch_yahoo(
         "^HSI", D(2024, 6, 3), D(2024, 6, 5), retry=SYNC_RETRY, legacy=True
     )
-    assert FakeTicker.calls[0] == {"start": D(2024, 6, 3), "end": D(2024, 6, 5), "actions": False}
+    assert FakeTicker.calls[0] == {"start": D(2024, 6, 3), "end": D(2024, 6, 5), "actions": True}
     assert result.price_basis == "yahoo_adjusted" and result.actions == []
 
 

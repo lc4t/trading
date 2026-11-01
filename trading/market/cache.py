@@ -29,6 +29,7 @@ from .clock import (
     local_naive_to_utc,
     utcnow,
 )
+from . import corporate
 from .errors import FetchError, RateLimited, ReadOnlyError, RequestError
 from .fetchers import RangePriceFetcher, series_type_for_symbol, upstream_route_for_symbol
 from .models import STABLE_BASES
@@ -182,22 +183,26 @@ class MarketCache:
         return result, written
 
     def _refresh_window(self, symbol: str, start: date, end: date) -> _Outcome:
-        """抓 [start, end] 并落库；检测到新的拆分事件时让更早的历史失效并补抓."""
+        """抓 [start, end] 并落库；检测到会改写历史的新公司行动时，把更早的历史也重写."""
         if self.store.read_only:
             raise ReadOnlyError("database is read-only")
         first_cached = self.store.first_date(symbol)
         result, _ = self._fetch_and_persist(symbol, start, end)
         self._tail_checked_at[symbol] = self._monotonic()  # 刚回过源，尾部检查间隔从现在算起
         outcome = _Outcome(refreshed=True, source=result.source)
-        new_actions = self.store.record_actions(symbol, result.actions, self._now())
-        splits = [a for a in new_actions if a["kind"] == "split"]
-        if splits and first_cached is not None and first_cached < start:
-            logger.warning(f"{symbol} 检测到新的拆分事件，历史行失效并重抓")
-            outcome.corrected_rows = self.store.invalidate_before(symbol, start)
+        verdict = corporate.assess(self.store, symbol, result, self._now())
+        if verdict.trigger and first_cached is not None and first_cached < start:
+            logger.warning(f"{symbol} 检测到新的公司行动 {[(a['kind'], a['ex_date']) for a in verdict.new]}，整段历史重写")
+            if result.price_basis in STABLE_BASES:
+                outcome.corrected_rows = self.store.invalidate_before(symbol, start)  # 失败时留下「非终值」标记等下次重试
             try:
                 self._fetch_and_persist(symbol, first_cached, start - timedelta(days=1))
             except FetchError as exc:
-                outcome.error = f"split_history_refetch_failed: {exc}"
+                failed = self._error_outcome(exc)
+                outcome.error = f"history_refetch_failed: {failed.error}" if failed.retry_after is None else failed.error
+                outcome.retry_after = failed.retry_after
+                return outcome  # 新事件不记录：下次刷新仍会判定为「新」，继续重试
+        corporate.commit(self.store, symbol, verdict.new, self._now())
         return outcome
 
     @staticmethod
