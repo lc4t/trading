@@ -274,35 +274,10 @@ class DBClient:
     def _clean_trading_data(
         self, data_list: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
-        """写入前清洗一遍：开高低收缺失/NaN 的记录直接跳过（缺一天数据，
-        好过让整批 INSERT 因为一条脏数据全部失败——MySQL 不接受 NaN 字面量，
-        单条记录 NaN 曾导致过整批（上百条历史数据）静默写入失败，参见
-        upsert_trading_data 报错 "nan can not be used with MySQL"）。
-        非核心字段（成交额/涨跌幅等）NaN 则清成 None，不影响这一天写入。
-        """
-        price_fields = ["open_price", "close_price", "high", "low"]
-        optional_fields = ["volume", "amount", "change", "change_pct"]
+        """写入前清洗（逻辑统一在 trading.market.rows.clean_rows）。"""
+        from ..market.rows import clean_rows
 
-        cleaned: List[Dict[str, Any]] = []
-        skipped_dates = []
-        for item in data_list:
-            if any(self._is_nan(item.get(field)) for field in price_fields):
-                skipped_dates.append(str(item.get("date")))
-                continue
-            cleaned_item = item.copy()
-            for field in optional_fields:
-                if self._is_nan(cleaned_item.get(field)):
-                    cleaned_item[field] = None
-            cleaned.append(cleaned_item)
-
-        if skipped_dates:
-            symbol = data_list[0].get("symbol", "?") if data_list else "?"
-            logger.warning(
-                f"{symbol} 有 {len(skipped_dates)} 条记录开高低收缺失/NaN，"
-                f"已跳过（不影响其余 {len(cleaned)} 条正常数据写入）: {skipped_dates}"
-            )
-
-        return cleaned
+        return clean_rows(data_list)
 
     def upsert_trading_data(self, data_list: List[Dict[str, Any]]) -> bool:
         """插入或更新交易数据（如果数据已存在且有变化则更新）"""

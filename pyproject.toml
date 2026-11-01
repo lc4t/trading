@@ -15,9 +15,14 @@ license = { text = "MIT" }
 dependencies = [
     "adata>=2.8.2",
     "backtrader>=1.9.78.123",
+    # mcp 经 pyjwt[crypto] 带进 cryptography，pymysql 也会因此导入它；
+    # 实测 cryptography>=47 的 aarch64 manylinux wheel 在 Apple 芯片上的 Linux 虚拟机（colima）里
+    # 导入即 SIGILL（46.0.7 正常），所以先卡在 <47；x86_64 / 原生环境是否受影响未验证。
+    "cryptography>=44,<47",
     "jinja2>=3.1.4",
     "loguru>=0.7.2",
     "matplotlib>=3.7.5",
+    "mcp>=1.27,<2",
     "numpy>=1.26.0",
     "pandas>=2.0.3",
     "prettytable>=3.11.0",
@@ -56,6 +61,7 @@ target-version = "py313"
 tt-backtest = "trading.cli.backtest:main"
 tt-fetcher = "trading.data.fetcher:main"
 tt-digest = "trading.cli.digest:main"
+trading-mcp = "trading.cli.serve:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
