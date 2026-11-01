@@ -2,7 +2,6 @@
 import datetime as dt
 import json
 
-import pytest
 
 from trading.cli import rebuild
 from trading.market.fetchers import FetchResult

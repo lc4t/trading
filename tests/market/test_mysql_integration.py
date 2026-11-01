@@ -85,3 +85,31 @@ def test_token_auth_and_tools_over_http_on_mysql(mysql_stack):
         assert client.post("/mcp", headers=headers, content=json.dumps(call)).status_code == 401
         ok = client.post("/mcp", headers={**headers, "Authorization": f"Bearer {TOKEN}"}, content=json.dumps(call))
         assert ok.status_code == 200 and ok.json()["result"]["structuredContent"]["count"] == 1
+
+
+def test_a_read_costs_exactly_one_round_trip_on_mysql(mysql_stack):
+    """读连接池：AUTOCOMMIT、归还不回滚、不 ping —— 一次读只向 MySQL 发一条命令."""
+    import pymysql.connections as pc
+    from sqlalchemy.engine import make_url
+
+    from trading.market.config import DatabaseConfig
+
+    store, cache, fetcher, clock = mysql_stack
+    store.upsert([make_row(SYM, D(2024, 6, 4), 1.1)], price_basis="raw")
+    u = make_url(URL)
+    cfg = DatabaseConfig(u.host, u.port or 3306, u.username, u.password or "", u.database)
+    fast = MarketStore(cfg.create_engine(), cfg.create_read_engine())
+    fast.query_range(SYM, D(2024, 6, 1), D(2024, 6, 30))  # 预热建连
+    sent = []
+    original = pc.Connection._execute_command
+
+    def counting(self, command, sql):
+        sent.append(sql)
+        return original(self, command, sql)
+
+    pc.Connection._execute_command = counting
+    try:
+        rows = fast.query_range(SYM, D(2024, 6, 1), D(2024, 6, 30))
+    finally:
+        pc.Connection._execute_command = original
+    assert len(rows) == 1 and len(sent) == 1
