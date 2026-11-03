@@ -268,7 +268,7 @@ docker logs trading-market    # 首次启动会在这里显示自动生成的 to
 ```bash
 # Claude Code
 claude mcp add --transport http trading-market http://localhost:8765/mcp \
-  --header "Authorization: Bearer $TT_MCP_TOKEN"
+  --header "Authorization: Bearer $TRADING_MCP_TOKEN"
 ```
 
 ```json
@@ -277,7 +277,7 @@ claude mcp add --transport http trading-market http://localhost:8765/mcp \
     "trading-market": {
       "type": "http",
       "url": "http://localhost:8765/mcp",
-      "headers": { "Authorization": "Bearer ${TT_MCP_TOKEN}" }
+      "headers": { "Authorization": "Bearer ${TRADING_MCP_TOKEN}" }
     }
   }
 }
@@ -363,13 +363,13 @@ tool=get_price_history server_ms=2310.4 db_ops=3 db_statements=3 db_ms=96.2 upst
 ## 遗留价格口径重建（`trading.cli.rebuild`）
 
 每晚同步只重写 `--start-date` 之后的窗口（Yahoo 标的），更早的行停在上次抓取时的复权口径；期间发生过分红/拆股的标的，窗口起点处会有一道价格「接缝」。
-`tt-rebuild`（即 `python -m trading.cli.rebuild`）一次性消除它：对 `price_basis` 为 `legacy_unknown` 的标的，用和每晚同步相同的口径重写**整段历史**。
+`trading-mcp rebuild`（底层模块是 `python -m trading.cli.rebuild`）一次性消除它：对 `price_basis` 为 `legacy_unknown` 的标的，用和每晚同步相同的口径重写**整段历史**。
 
 ```bash
-python -m trading.cli.rebuild                      # 默认 dry-run：只抓取、比对、出报告，不写库
-python -m trading.cli.rebuild --symbol 0700.HK     # 只看某个标的
-python -m trading.cli.rebuild --apply              # 先备份受影响的全部行，再单事务写入，写后校验指纹
-python -m trading.cli.rebuild --rollback DIR       # 用备份目录原样回滚（含 create/update_time，并删除重建时新插入的日期）
+trading-mcp rebuild                      # 默认 dry-run：只抓取、比对、出报告，不写库
+trading-mcp rebuild --symbol 0700.HK     # 只看某个标的
+trading-mcp rebuild --apply              # 先备份受影响的全部行，再单事务写入，写后校验指纹
+trading-mcp rebuild --rollback DIR       # 用备份目录原样回滚（含 create/update_time，并删除重建时新插入的日期）
 ```
 
 - dry-run 报告每个标的：现有行数/日期范围、上游返回行数、价格变化的行数、变化范围与相对差异（接缝在哪、有多大）、新增日期，以及**同日期的指纹对比**（现有 → 重建后）。

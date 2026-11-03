@@ -52,7 +52,7 @@ class CallStats:
             return out
 
 
-current: ContextVar[Optional[CallStats]] = ContextVar("tt_call_stats", default=None)
+current: ContextVar[Optional[CallStats]] = ContextVar("trading_mcp_call_stats", default=None)
 
 
 @contextlib.contextmanager

@@ -66,7 +66,7 @@ def free_port() -> int:
 
 class Mysql:
     def __init__(self):
-        self.name = f"tt-regression-{secrets.token_hex(4)}"
+        self.name = f"trading-regression-{secrets.token_hex(4)}"
         self.root_pw = secrets.token_urlsafe(12)
         self.user_pw = secrets.token_urlsafe(12)
         self.port = free_port()
@@ -111,7 +111,7 @@ def main() -> int:
     ap.add_argument("--keep", action="store_true", help="结束后保留临时目录（排查差异用）")
     args = ap.parse_args()
 
-    work = Path(tempfile.mkdtemp(prefix="tt-regression-"))
+    work = Path(tempfile.mkdtemp(prefix="trading-regression-"))
     base_dir = work / "baseline"
     base_dir.mkdir()
     mysql = Mysql()

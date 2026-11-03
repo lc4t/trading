@@ -306,3 +306,15 @@ def test_mcp_token_minimum_length_is_24():
     with pytest.raises(ConfigError):
         load_config({**DB, "MCP_TOKEN": "x" * 23})
     assert load_config({**DB, "MCP_TOKEN": "x" * 24}).tokens.authenticate("x" * 24) is not None
+
+
+# ------------------------------------------------------------------ 命令名
+def test_rebuild_is_a_trading_mcp_subcommand_and_old_names_are_gone(capsys):
+    import pathlib
+    import tomllib
+
+    with pytest.raises(SystemExit) as exc:
+        serve.main(["rebuild", "--help"])
+    assert exc.value.code == 0 and "trading-mcp rebuild" in capsys.readouterr().out
+    scripts = tomllib.loads((pathlib.Path(__file__).parents[2] / "pyproject.toml").read_text())["project"]["scripts"]
+    assert "trading-mcp" in scripts and "tt-rebuild" not in scripts and "tt-serve" not in scripts
