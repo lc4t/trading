@@ -8,6 +8,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import secrets
 import time
 from typing import Any, Callable, Dict, List, Literal, Optional
 
@@ -29,7 +30,7 @@ from .auth import (
 from .config import ServerConfig
 from .errors import FetchError, RequestError
 from . import timing
-from .service import MarketService, NoDataError
+from .service import MarketService, NoDataError, RateLimitedError
 
 logger = logging.getLogger("trading.market.server")
 
@@ -75,8 +76,10 @@ async def _run(fn: Callable[..., Any], *args: Any, label: Optional[str] = None) 
         raise
     except Exception as exc:  # noqa: BLE001
         # 完整堆栈只进服务端日志（不含 token；SQL 参数是行情数据，不是密钥）
-        logger.error("tool failed: %s", type(exc).__name__, exc_info=True)
-        raise RuntimeError("internal error; see server logs") from None
+        error_id = secrets.token_hex(4)
+        logger.error("tool failed id=%s tool=%s: %s", error_id, name, type(exc).__name__, exc_info=True)
+        # error_id 同时出现在返回和日志里，调用方报障时给这个 id 就能直接定位堆栈
+        raise RuntimeError(f"internal error (id={error_id}); see server logs") from None
     finally:
         timing.current.reset(token)
         snap = stats.snapshot()
@@ -131,7 +134,16 @@ def create_mcp(
     )
 
     async def run(fn: Callable[..., Any], *args: Any, label: Optional[str] = None) -> Any:
-        return _package(await _run(fn, *args, label=label), config.text_content)
+        try:
+            return _package(await _run(fn, *args, label=label), config.text_content)
+        except RateLimitedError as exc:
+            # 结构化错误：isError=true，但 structuredContent.error.code / retry_after 让客户端知道要等多久，
+            # 而不是收到一个泛化异常就立刻重试
+            body = exc.body()
+            text = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+            return CallToolResult(
+                isError=True, content=[TextContent(type="text", text=text)], structuredContent=body
+            )
 
     @mcp.tool()
     async def get_price_history(

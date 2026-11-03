@@ -87,6 +87,27 @@ def _token_cmd(args: argparse.Namespace) -> int:
         return 2
 
 
+def _upstream_policies():
+    """可选的环境变量覆盖：对所有上游来源统一调整冷却基准/上限和请求间隔（秒）。"""
+    from ..market.upstream import DEFAULT_POLICIES, UpstreamPolicy
+
+    def num(key):
+        raw = os.environ.get(key)
+        try:
+            return float(raw) if raw else None
+        except ValueError:
+            return None
+
+    base, cap, gap = (num("MCP_UPSTREAM_COOLDOWN_SECONDS"), num("MCP_UPSTREAM_COOLDOWN_MAX_SECONDS"),
+                      num("MCP_UPSTREAM_MIN_INTERVAL_SECONDS"))
+    if base is None and cap is None and gap is None:
+        return None
+    return {
+        name: UpstreamPolicy(base or p.base_cooldown, cap or p.max_cooldown, gap if gap is not None else p.min_interval)
+        for name, p in DEFAULT_POLICIES.items()
+    }
+
+
 def _announce_bootstrap(boot) -> None:
     bar = "=" * 72
     lines = [
@@ -137,6 +158,7 @@ def _serve(_: argparse.Namespace) -> int:
     from ..market.server import create_app
     from ..market.service import MarketService
     from ..market.store import MarketStore, is_privilege_error
+    from ..market.upstream import GuardedFetcher, UpstreamGuard
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     log = logging.getLogger("trading.market")
@@ -146,8 +168,9 @@ def _serve(_: argparse.Namespace) -> int:
         print(f"配置错误: {exc}", file=sys.stderr)
         return 2
 
-    engine = config.database.create_engine()
-    store = MarketStore(engine)
+    pre_ping = (os.environ.get("DB_POOL_PRE_PING") or "").strip().lower() in {"1", "true", "yes", "on"}
+    engine = config.database.create_engine(pre_ping=pre_ping)
+    store = MarketStore(engine, config.database.create_read_engine())
     deadline = time.monotonic() + DB_WAIT_SECONDS
     while True:
         try:
@@ -182,7 +205,8 @@ def _serve(_: argparse.Namespace) -> int:
     if boot is not None:
         _announce_bootstrap(boot)
 
-    cache = MarketCache(store, RangePriceFetcher())
+    guard = UpstreamGuard(policies=_upstream_policies(), store=store)
+    cache = MarketCache(store, GuardedFetcher(RangePriceFetcher(), guard))
     backtests = BacktestTools(store, cache, config)
     app = create_app(config, MarketService(cache), store.ping, backtests)
 

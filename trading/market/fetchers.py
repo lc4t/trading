@@ -22,7 +22,9 @@ from zoneinfo import ZoneInfo
 from loguru import logger
 
 from .clock import is_off_market_fund
-from .errors import FetchError
+import random
+
+from .errors import FetchError, RateLimited
 
 EASTMONEY_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
 EASTMONEY_FUND_NAV_URL = "https://api.fund.eastmoney.com/f10/lsjz"
@@ -42,10 +44,14 @@ class RetryPolicy:
 
     attempts: int = 2
     delay: Callable[[int], float] = lambda n: 0.5
+    # 请求路径：命中限流就立刻放弃（交给冷却保护），绝不在限流时重试加重封禁
+    stop_on_rate_limit: bool = False
 
 
 # 服务请求路径：最多 2 次，间隔 ≤ 1s，绝不长时间 sleep
-REQUEST_RETRY = RetryPolicy(attempts=2, delay=lambda n: 0.5)
+REQUEST_RETRY = RetryPolicy(
+    attempts=2, delay=lambda n: 0.4 + 0.4 * random.random(), stop_on_rate_limit=True
+)  # 退避带抖动
 # tt-fetcher 批量同步沿用历史行为：Yahoo 限流最多 10 次、30+60*n 秒
 SYNC_RETRY = RetryPolicy(attempts=10, delay=lambda n: 30 + 60 * n)
 
@@ -83,6 +89,14 @@ def upstream_route_for_symbol(symbol: str, mode: str = "raw") -> str:
     return "yahoo_unadjusted_market_price" if mode == "raw" else "yahoo_adjusted_market_price"
 
 
+def _retry_after_seconds(headers: Any) -> Optional[float]:
+    try:
+        value = (headers or {}).get("Retry-After")
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _request_with_retry(get: Any, url: str, retry: RetryPolicy, **kwargs: Any) -> Any:
     last: Exception | None = None
     for attempt in range(retry.attempts):
@@ -91,6 +105,10 @@ def _request_with_retry(get: Any, url: str, retry: RetryPolicy, **kwargs: Any) -
             response.raise_for_status()
             return response
         except Exception as exc:  # noqa: BLE001 - 统一归一成上游失败
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if status == 429:
+                after = _retry_after_seconds(getattr(exc.response, "headers", None))
+                raise RateLimited("upstream", after or 60.0, "upstream HTTP 429") from exc
             last = exc
             if attempt < retry.attempts - 1:
                 time.sleep(retry.delay(attempt))
@@ -150,6 +168,8 @@ class RangePriceFetcher:
                 timeout=20,
             )
             lines = (response.json().get("data") or {}).get("klines") or []
+        except RateLimited:
+            raise
         except Exception as exc:
             raise FetchError(f"Eastmoney range request failed ({type(exc).__name__})") from exc
 
@@ -187,6 +207,8 @@ class RangePriceFetcher:
         if (end - start).days > LONG_NAV_SPAN_DAYS:
             try:
                 return self._fund_trend(symbol, start, end, retry)
+            except RateLimited:
+                raise
             except FetchError:
                 pass
         headers = {
@@ -236,6 +258,8 @@ class RangePriceFetcher:
                 return FetchResult(
                     sorted(rows, key=lambda r: r["date"]), "eastmoney_fund_nav_api", "raw"
                 )
+        except RateLimited:
+            raise
         except Exception:  # noqa: BLE001 - 回退到趋势脚本
             pass
         return self._fund_trend(symbol, start, end, retry)
@@ -273,7 +297,7 @@ class RangePriceFetcher:
             return FetchResult(
                 sorted(rows, key=lambda r: r["date"]), "eastmoney_fund_nav_trend_fallback", "raw"
             )
-        except FetchError:
+        except (FetchError, RateLimited):
             raise
         except Exception as exc:
             raise FetchError(
@@ -309,7 +333,8 @@ class RangePriceFetcher:
             YFRateLimitError = ()  # type: ignore[assignment]
 
         if legacy:
-            kwargs: Dict[str, Any] = {"start": start, "end": end, "actions": False}
+            # 价格口径与历史完全一致（auto_adjust 默认 True）；多要分红/拆股事件，用来判断何时必须整段重写
+            kwargs: Dict[str, Any] = {"start": start, "end": end, "actions": True}
         else:
             kwargs = {
                 "start": start,
@@ -327,6 +352,8 @@ class RangePriceFetcher:
             except YFRateLimitError as exc:
                 last = exc
                 logger.warning(f"Yahoo 限流 {symbol}（第 {attempt + 1}/{retry.attempts} 次）")
+                if retry.stop_on_rate_limit:
+                    raise RateLimited("yahoo", 120.0, "Yahoo Finance rate limited") from exc
                 if attempt < retry.attempts - 1:
                     time.sleep(retry.delay(attempt))
             except Exception as exc:  # noqa: BLE001
@@ -343,6 +370,12 @@ class RangePriceFetcher:
             trade_date = index.date()
             if not start <= trade_date <= end:
                 continue
+            dividend = _number(record.get("Dividends", 0))
+            split = _number(record.get("Stock Splits", 0))
+            if dividend:
+                actions.append({"ex_date": trade_date, "kind": "dividend", "value": dividend})
+            if split:
+                actions.append({"ex_date": trade_date, "kind": "split", "value": split})
             o, c = _number(record["Open"]), _number(record["Close"])
             h, lo = _number(record["High"]), _number(record["Low"])
             if None in {o, c, h, lo}:
@@ -363,15 +396,8 @@ class RangePriceFetcher:
                     "change_pct": None,
                 }
             )
-            if not legacy:
-                dividend = _number(record.get("Dividends", 0))
-                split = _number(record.get("Stock Splits", 0))
-                if dividend:
-                    actions.append({"ex_date": trade_date, "kind": "dividend", "value": dividend})
-                if split:
-                    actions.append({"ex_date": trade_date, "kind": "split", "value": split})
         if legacy:
-            return FetchResult(rows, "yahoo_auto_adjust", "yahoo_adjusted")
+            return FetchResult(rows, "yahoo_auto_adjust", "yahoo_adjusted", actions=actions)
         return FetchResult(rows, "yahoo_unadjusted", "split_adjusted", actions=actions)
 
 
@@ -398,7 +424,8 @@ def ths_etf_rows(symbol: str) -> List[Dict[str, Any]]:
     logger.info(f"正在获取 {symbol} 的数据（同花顺 ETF 前复权全量）")
     data = adata.fund.market.get_market_etf(symbol.split(".")[0], k_type=1)
     if isinstance(data, Exception):
-        raise FetchError(f"THS ETF request failed ({type(data).__name__})")
+        # adata 在同花顺 IP 限制时返回的是 Exception 对象而不是抛出
+        raise RateLimited("ths", 600.0, "THS ETF request hit the IP limit")
     if data.empty:
         logger.warning(f"No data fetched for {symbol} from AData")
         return []

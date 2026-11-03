@@ -13,9 +13,10 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 import pandas as pd
 from loguru import logger
-from sqlalchemy import and_, func, text, update
+from sqlalchemy import and_, case, delete, func, text, update
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError, SQLAlchemyError
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from sqlalchemy.orm import Session, sessionmaker
 
 from ..data.repository import Base, TradingData
@@ -28,6 +29,7 @@ from .models import (
     STABLE_BASES,
     MarketCorporateAction,
     MarketDataMeta,
+    MarketUpstreamState,
 )
 
 _QUANT = Decimal(f"0.{'0' * TradingData.STORAGE_SCALE}")
@@ -55,11 +57,12 @@ def retry_transient(fn):
             try:
                 with timed("db"):
                     return fn(self, *args, **kwargs)
-            except DBAPIError as exc:
-                transient = _errno(exc) in TRANSIENT_ERRNOS or exc.connection_invalidated
+            except (DBAPIError, PoolTimeoutError) as exc:
+                # 连接池取连接超时（突发并发占满连接）同样是瞬时的
+                transient = isinstance(exc, PoolTimeoutError) or _errno(exc) in TRANSIENT_ERRNOS or exc.connection_invalidated
                 if attempt == DB_RETRY_ATTEMPTS - 1 or not transient:
                     raise
-                logger.warning(f"数据库瞬时故障（errno={_errno(exc)}），第 {attempt + 1} 次重试")
+                logger.warning(f"数据库瞬时故障（{type(exc).__name__} errno={_errno(exc)}），第 {attempt + 1} 次重试")
                 time.sleep(0.2 * (attempt + 1))
 
     return wrapper
@@ -91,10 +94,14 @@ def _insert_for(engine: Engine):
 
 
 class MarketStore:
-    def __init__(self, engine: Engine) -> None:
+    def __init__(self, engine: Engine, read_engine: Optional[Engine] = None) -> None:
         self.engine = engine
+        self.read_engine = read_engine or engine
         self.Session = sessionmaker(bind=engine)
+        self.ReadSession = sessionmaker(bind=self.read_engine)
         install_statement_counter(engine)
+        if self.read_engine is not engine:
+            install_statement_counter(self.read_engine)
         self._insert = _insert_for(engine)
         # 旁表建不出来（例如 DB 账号没有 DDL 权限）时降级为只写 trading_data，
         # 保证 tt-fetcher 每日同步不受影响；MCP 服务启动时则要求必须可用。
@@ -181,7 +188,7 @@ class MarketStore:
 
     @retry_transient
     def query_range(self, symbol: str, start: dt.date, end: dt.date) -> List[Dict[str, Any]]:
-        with self.Session() as session:
+        with self.ReadSession() as session:
             if self.meta_enabled:
                 query = (
                     self._joined_query(session, symbol)
@@ -198,7 +205,7 @@ class MarketStore:
 
     @retry_transient
     def query_latest(self, symbol: str) -> Optional[Dict[str, Any]]:
-        with self.Session() as session:
+        with self.ReadSession() as session:
             if self.meta_enabled:
                 pair = (
                     self._joined_query(session, symbol)
@@ -216,7 +223,7 @@ class MarketStore:
 
     @retry_transient
     def first_date(self, symbol: str) -> Optional[dt.date]:
-        with self.Session() as session:
+        with self.ReadSession() as session:
             return session.query(func.min(TradingData.date)).filter(
                 TradingData.symbol == symbol
             ).scalar()
@@ -229,7 +236,7 @@ class MarketStore:
         - ``legacy``：存在遗留行（无元数据）或前复权/Yahoo 调整口径的行；沿用与历史一致的
           抓取方式，避免同一条序列里混入两种价格口径。
         """
-        with self.Session() as session:
+        with self.ReadSession() as session:
             total = session.query(func.count()).select_from(TradingData).filter(
                 TradingData.symbol == symbol
             ).scalar()
@@ -257,7 +264,7 @@ class MarketStore:
 
     def ohlcv_frame(self, symbol: str, start: Any, end: Any) -> pd.DataFrame:
         """回测引擎取数：与历史上 ``fetch_symbol_data`` 返回的 DataFrame 完全一致."""
-        with self.Session() as session:
+        with self.ReadSession() as session:
             df = pd.read_sql(
                 session.query(TradingData)
                 .filter(
@@ -278,7 +285,7 @@ class MarketStore:
 
     def close_series(self, symbol: str, start: Any, end: Any) -> List[Any]:
         """基准日收益用：[(date, close_price)]，按日期升序."""
-        with self.Session() as session:
+        with self.ReadSession() as session:
             rows = (
                 session.query(TradingData)
                 .filter(
@@ -396,6 +403,164 @@ class MarketStore:
             session.commit()
             return result.rowcount or 0
 
+    # ------------------------------------------------- 遗留口径重建（trading.cli.rebuild）
+    def probe_meta(self) -> bool:
+        """旁表是否存在且可读（dry-run 时旁表可能还没建）。"""
+        try:
+            with self.read_engine.connect() as conn:
+                for table in META_TABLES:
+                    conn.execute(text(f"SELECT 1 FROM {table.name} LIMIT 1"))
+            self.meta_enabled = True
+        except SQLAlchemyError:
+            self.meta_enabled = False
+        return self.meta_enabled
+
+    @retry_transient
+    def legacy_summary(self) -> List[Dict[str, Any]]:
+        """每个标的的行数、日期范围，以及其中口径未知（没有旁表记录或 legacy_unknown）的行数。"""
+        with self.ReadSession() as session:
+            if self.meta_enabled:
+                unknown = func.sum(
+                    case(
+                        (MarketDataMeta.price_basis.is_(None), 1),
+                        (MarketDataMeta.price_basis == "legacy_unknown", 1),
+                        else_=0,
+                    )
+                )
+                query = (
+                    session.query(
+                        TradingData.symbol, func.count(), func.min(TradingData.date),
+                        func.max(TradingData.date), unknown,
+                    )
+                    .outerjoin(
+                        MarketDataMeta,
+                        and_(MarketDataMeta.symbol == TradingData.symbol, MarketDataMeta.date == TradingData.date),
+                    )
+                    .group_by(TradingData.symbol)
+                )
+            else:
+                query = session.query(
+                    TradingData.symbol, func.count(), func.min(TradingData.date),
+                    func.max(TradingData.date), func.count(),
+                ).group_by(TradingData.symbol)
+            return [
+                {"symbol": r[0], "rows": int(r[1]), "first": r[2], "last": r[3], "legacy_rows": int(r[4] or 0)}
+                for r in query.order_by(TradingData.symbol).all()
+            ]
+
+    @retry_transient
+    def export_snapshot(self, symbol: str) -> Dict[str, Any]:
+        """导出某标的 trading_data 与旁表的全部行（完整精度，字符串化），用于备份。"""
+
+        def enc(value: Any) -> Any:
+            if value is None:
+                return None
+            if isinstance(value, (dt.datetime, dt.date)):
+                return value.isoformat()
+            return str(value)
+
+        with self.ReadSession() as session:
+            data = [
+                {c.name: enc(getattr(r, c.name)) for c in TradingData.__table__.columns}
+                for r in session.query(TradingData).filter(TradingData.symbol == symbol).order_by(TradingData.date)
+            ]
+            meta = []
+            if self.meta_enabled:
+                meta = [
+                    {c.name: (bool(getattr(r, c.name)) if c.name == "is_final" else enc(getattr(r, c.name)))
+                     for c in MarketDataMeta.__table__.columns}
+                    for r in session.query(MarketDataMeta).filter(MarketDataMeta.symbol == symbol).order_by(MarketDataMeta.date)
+                ]
+        return {"trading_data": data, "meta": meta}
+
+    def restore_snapshot(self, symbol: str, snapshot: Dict[str, Any], delete_dates: List[dt.date]) -> None:
+        """把 export_snapshot 的结果原样写回（含 create/update_time），并删除重建时新插入的日期；单事务。"""
+        if self.read_only:
+            raise ReadOnlyError("database is read-only")
+        decimal_cols = {"open_price", "close_price", "high", "low", "amount", "change", "change_pct"}
+
+        def dec(row: Dict[str, Any]) -> Dict[str, Any]:
+            out: Dict[str, Any] = {}
+            for k, v in row.items():
+                if v is None:
+                    out[k] = None
+                elif k == "date":
+                    out[k] = dt.date.fromisoformat(v)
+                elif k in {"create_time", "update_time"}:
+                    out[k] = dt.datetime.fromisoformat(v)
+                elif k in decimal_cols:
+                    out[k] = Decimal(v)
+                elif k == "volume":
+                    out[k] = int(v)
+                else:
+                    out[k] = v
+            return out
+
+        data = [dec(r) for r in snapshot["trading_data"]]
+        meta = []
+        for r in snapshot["meta"]:
+            m = dict(r)
+            m["date"] = dt.date.fromisoformat(m["date"])
+            for k in ("as_of", "fetched_at"):
+                m[k] = dt.datetime.fromisoformat(m[k]) if m.get(k) else None
+            meta.append(m)
+        with self._writing(), self.Session() as session:
+            all_dates = [r["date"] for r in data] + list(delete_dates)
+            for i in range(0, len(all_dates), 500):
+                chunk = all_dates[i : i + 500]
+                if self.meta_enabled:
+                    session.execute(
+                        delete(MarketDataMeta).where(MarketDataMeta.symbol == symbol, MarketDataMeta.date.in_(chunk))
+                    )
+            for i in range(0, len(list(delete_dates)), 500):
+                session.execute(
+                    delete(TradingData).where(TradingData.symbol == symbol, TradingData.date.in_(list(delete_dates)[i : i + 500]))
+                )
+            for i in range(0, len(data), 500):
+                stmt = self._insert(TradingData.__table__).values(data[i : i + 500])
+                ref = stmt.excluded if self.engine.dialect.name == "sqlite" else stmt.inserted
+                cols = {c.name: getattr(ref, c.name) for c in TradingData.__table__.columns if c.name not in {"symbol", "date"}}
+                session.execute(self._apply_conflict(stmt, cols, ["symbol", "date"]))
+            if self.meta_enabled:
+                for i in range(0, len(meta), 500):
+                    session.execute(self._insert(MarketDataMeta.__table__).values(meta[i : i + 500]))
+            session.commit()
+
+    # ----------------------------------------------------------- upstream cooldown
+    @retry_transient
+    def load_cooldowns(self) -> Dict[str, tuple]:
+        if not self.meta_enabled:
+            return {}
+        with self.ReadSession() as session:
+            return {
+                r.source: (r.cooldown_until, int(r.failures))
+                for r in session.query(MarketUpstreamState).all()
+            }
+
+    def save_cooldown(self, source: str, until: dt.datetime, failures: int) -> None:
+        if not self.meta_enabled or self.read_only:
+            return
+        now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+        stmt = self._insert(MarketUpstreamState.__table__).values(
+            source=source, cooldown_until=until, failures=failures, updated_at=now
+        )
+        ref = stmt.excluded if self.engine.dialect.name == "sqlite" else stmt.inserted
+        stmt = self._apply_conflict(
+            stmt,
+            {"cooldown_until": ref.cooldown_until, "failures": ref.failures, "updated_at": ref.updated_at},
+            ["source"],
+        )
+        with self._writing(), self.Session() as session:
+            session.execute(stmt)
+            session.commit()
+
+    def clear_cooldown(self, source: str) -> None:
+        if not self.meta_enabled or self.read_only:
+            return
+        with self._writing(), self.Session() as session:
+            session.query(MarketUpstreamState).filter(MarketUpstreamState.source == source).delete()
+            session.commit()
+
     # ---------------------------------------------------------- corporate actions
     @retry_transient
     def record_actions(
@@ -435,7 +600,7 @@ class MarketStore:
     def list_actions(self, symbol: str) -> List[Dict[str, Any]]:
         if not self.meta_enabled:
             return []
-        with self.Session() as session:
+        with self.ReadSession() as session:
             return [
                 {"ex_date": a.ex_date, "kind": a.kind, "value": float(a.value)}
                 for a in session.query(MarketCorporateAction)
@@ -445,6 +610,8 @@ class MarketStore:
 
     def close(self) -> None:
         self.engine.dispose()
+        if self.read_engine is not self.engine:
+            self.read_engine.dispose()
 
 
 class _WriteGuard:

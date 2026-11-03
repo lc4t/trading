@@ -210,7 +210,7 @@ def test_unexpected_tool_errors_return_generic_message_but_log_traceback(make_cl
     caplog.set_level(logging.ERROR)
     with make_client() as client:
         result = call(client, READ_TOKEN, "get_latest_price", {"symbol": "159915.SZ"}).json()["result"]
-    assert result["isError"] is True and "internal error" in result["content"][0]["text"]
+    assert result["isError"] is True and "internal error (id=" in result["content"][0]["text"]
     assert "secret-detail" not in result["content"][0]["text"]
     record = next(r for r in caplog.records if "tool failed" in r.getMessage())
     assert record.exc_info and record.exc_info[0] is KeyError  # 服务端日志里有完整堆栈
@@ -254,3 +254,14 @@ def test_invalid_text_content_mode_rejected():
 
     with pytest.raises(ConfigError):
         load_config(env(MCP_TEXT_CONTENT="xml"))
+
+
+def test_internal_error_id_matches_the_logged_traceback(make_client, cache, caplog, monkeypatch):
+    import re
+
+    monkeypatch.setattr(cache, "get_latest", lambda *a, **k: (_ for _ in ()).throw(KeyError("boom")))
+    caplog.set_level(logging.ERROR)
+    with make_client() as client:
+        text = call(client, READ_TOKEN, "get_latest_price", {"symbol": "159915.SZ"}).json()["result"]["content"][0]["text"]
+    error_id = re.search(r"id=([0-9a-f]{8})", text).group(1)
+    assert any(f"id={error_id}" in r.getMessage() and r.exc_info for r in caplog.records)

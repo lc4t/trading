@@ -22,6 +22,29 @@ class NoDataError(RuntimeError):
     """缓存与上游都没有可返回的日线."""
 
 
+class RateLimitedError(NoDataError):
+    """完全没有缓存、而上游正在限流冷却：返回结构化错误（带 retry_after），不是让客户端立刻重试的泛化异常."""
+
+    def __init__(self, retry_after: int, symbols: List[str]) -> None:
+        self.retry_after = int(retry_after)
+        self.symbols = symbols
+        super().__init__(
+            f"upstream is rate limited and nothing is cached for {', '.join(symbols)}; "
+            f"retry after {self.retry_after}s"
+        )
+
+    def body(self) -> Dict[str, Any]:
+        return {
+            "error": {
+                "code": "rate_limited",
+                "retry_after": self.retry_after,
+                "symbols": self.symbols,
+                "message": str(self),
+            },
+            "retry_after": self.retry_after,
+        }
+
+
 def serialize_row(row: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     for key, value in row.items():
@@ -118,6 +141,7 @@ class MarketService:
                 "refreshed": payload["refreshed"],
                 "tail_refreshed": payload["tail_refreshed"],
                 "tail_refresh_error": payload["tail_refresh_error"],
+                "retry_after": payload["retry_after"],
                 "count": payload["count"],
                 "coverage_start": dates[0] if dates else None,
                 "coverage_end": dates[-1] if dates else None,
@@ -130,6 +154,11 @@ class MarketService:
                 "nonfinal_count": payload["nonfinal_count"],
                 "corrected_rows": payload["corrected_rows"],
             }
+        limited = [
+            (sym, c["retry_after"]) for sym, c in cache_info.items() if c["tail_refresh_error"] == "rate_limited"
+        ]
+        if not views and limited:
+            raise RateLimitedError(max(r for _, r in limited), [sym for sym, _ in limited])
         if not views:
             hint = (
                 " (database is read-only: nothing cached and upstream refresh is disabled)"
@@ -143,7 +172,9 @@ class MarketService:
                 + hint
             )
         views.sort(key=lambda v: (v["date"], v["symbol"]))
+        retry_after = max((r for _, r in limited), default=None)
         return {
+            **({"retry_after": retry_after} if retry_after else {}),
             "cache": cache_info,
             "data_fingerprint": fingerprint(views),
             "state_fingerprint": state_fingerprint(views),
@@ -162,6 +193,8 @@ class MarketService:
 
     def _latest(self, symbol: str, refresh: str, adjust: str) -> Dict[str, Any]:
         payload = self.cache.get_latest(symbol, refresh, adjust)
+        if payload["data"] is None and payload["tail_refresh_error"] == "rate_limited":
+            raise RateLimitedError(payload["retry_after"], [symbol])
         if payload["data"] is None:
             raise NoDataError(f"No daily market data for {symbol}")
         payload["data"] = serialize_row(payload["data"])

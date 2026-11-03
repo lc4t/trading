@@ -188,6 +188,8 @@ result.plot()         # → matplotlib figure
 | `MCP_RATE_LIMIT_{READ,REFRESH,BACKTEST}_PER_MIN` | 否 | 每个 token 每分钟调用上限，默认 120 / 10 / 6 |
 | `MCP_BACKTEST_{CONCURRENCY,MAX_SPAN_DAYS,MAX_SYMBOLS}` | 否 | 回测并发 / 单次区间天数 / 标的数上限，默认 2 / 3660 / 20 |
 | `MCP_TEXT_CONTENT` | 否 | 响应里 `content` 文本部分：`json`（默认，紧凑 JSON）或 `summary`（一行摘要，数据只在 `structuredContent`，响应体约减半） |
+| `MCP_UPSTREAM_COOLDOWN_SECONDS` / `MCP_UPSTREAM_COOLDOWN_MAX_SECONDS` / `MCP_UPSTREAM_MIN_INTERVAL_SECONDS` | 否 | 上游限流冷却的基准 / 上限 / 请求最小间隔（秒），对所有来源统一覆盖；默认 Yahoo 120 / 1800 / 1，东财 60 / 900 / 0.3 |
+| `DB_POOL_PRE_PING` | 否 | 设为 `1` 开启连接池取连接前的 ping（默认关，省一个往返；断连由存储层幂等重试兜底） |
 | `MCP_READ_ONLY` | 否 | 设为 `1` 强制只读模式（见下）；账号没有写权限时也会自动进入 |
 | `MCP_ALLOWED_HOSTS` | 否 | 逗号分隔的 Host 白名单；设置后启用 DNS-rebinding 防护 |
 
@@ -318,7 +320,30 @@ tool=get_price_history server_ms=2310.4 db_ops=3 db_statements=3 db_ms=96.2 upst
 | `upstream_calls` / `upstream_ms` | 回源次数 / 累计毫秒（东财、Yahoo 等） |
 | `symbols[]` | 逐标的的 `ms`、`db_ms`、`upstream_ms`、`refreshed`；总耗时 ≥ 1s 时日志里还会列出最慢的 5 个 |
 
-`db_ms` 很大而 `db_statements` 很少，说明是数据库往返慢（跨地域）；`upstream_ms` 大说明是回源（尾部检查每 10 分钟每个标的一次）。
+一次读请求只有 1 个数据库往返（读连接池是 AUTOCOMMIT、归还时不回滚、不 ping；写连接池默认也不 ping）。`db_ms` 很大而 `db_statements` 很少，说明是数据库往返慢（跨地域）；`upstream_ms` 大说明是回源（尾部检查每 10 分钟每个标的一次）。
+
+### 上游限流与错误契约
+
+上游限流（Yahoo 的 rate limit、HTTP 429、同花顺的 IP 限制）按**异常**处理，服务端负责不把上游越撞越死，调用方负责等待：
+
+- **按来源冷却（熔断）**：命中限流后该来源（`yahoo` / `eastmoney` / `eastmoney_fund` / `ths`）进入冷却，**冷却期内不发起任何上游请求**；
+  冷却时长指数增长（连续触发越多越久）、带 ±20% 抖动、有上限，成功一次即清零；上游给了 `Retry-After` 就以它为下限。
+- **请求间隔与排队上限**：同一来源两次上游请求之间至少隔一段（Yahoo 1s）；排队等待超过 5s 就不再排，直接返回限流，请求路径上不会长时间 sleep。
+- **single-flight**：同一标的的并发刷新合并成一次，后到的请求共享结果；请求路径命中限流立即放弃、不重试，其它错误最多 2 次带抖动的短重试。
+- **持久化**：冷却状态写进 `market_upstream_state` 旁表，重启和多实例共享；写不进去（只读账号等）就退回只在进程内生效。
+  取舍：多一次很便宜的旁表读（每 5 秒最多一次）和只在触发冷却时的一次写，换来重启后不会立刻又去撞限流。
+
+**对调用方的契约**（只做加法）：
+
+| 情形 | 表现 |
+| ---- | ---- |
+| 冷却期内、库里有缓存行 | 正常结果（`isError=false`），缓存行照常返回；`cache[symbol].tail_refresh_error = "rate_limited"`，`cache[symbol].retry_after`（整数秒，≥1，随时间递减）；多标的结果顶层另有 `retry_after`（各标的最大值）。`get_latest_*` 的 `tail_refresh_error` / `retry_after` 在顶层 |
+| 冷却期内、**完全没有缓存** | **结构化错误**：`isError=true`，`structuredContent = {"error": {"code": "rate_limited", "retry_after": 87, "symbols": ["AAPL"], "message": "..."}, "retry_after": 87}`（`content` 文本是同一份 JSON） |
+| 多标的、部分没缓存 | 有缓存的照常返回；没缓存的标的 `cache_status="empty"` 且带 `tail_refresh_error="rate_limited"`；整个结果一行都没有时才走上面的结构化错误 |
+| 服务自己的按 token 限流 | HTTP 429 + `Retry-After` 头（与上游限流无关） |
+| 内部错误 | `isError=true`，文本 `internal error (id=xxxxxxxx); see server logs`，`id` 与服务端日志里的堆栈一一对应；可以有上限地重试（建议 ≤2 次、带退避），重试仍失败请带上 `id` 报障 |
+
+**客户端应当**：看到 `retry_after` 就**等够这么多秒再来**（可加抖动），且重试次数有上限，不要在限流期间循环重试——冷却期内每次重试都不会触达上游，只会白白得到同样的答案。
 
 ### 缓存语义
 
@@ -334,6 +359,27 @@ tool=get_price_history server_ms=2310.4 db_ops=3 db_statements=3 db_ms=96.2 upst
   只有全新的标的才用不复权口径；一条序列里出现多种口径时 `price_basis="mixed"`，`price_bases` 列出全部。
 - 上游失败时返回缓存并在 `tail_refresh_error` 里说明；请求路径上只做最多 2 次、间隔 ≤ 0.5s 的短重试，失败后 60 秒静默期内不再打上游。
   （`tt-fetcher` 批量同步保留历史行为：Yahoo 限流最多 10 次、30+60n 秒退避。）
+
+## 遗留价格口径重建（`trading.cli.rebuild`）
+
+每晚同步只重写 `--start-date` 之后的窗口（Yahoo 标的），更早的行停在上次抓取时的复权口径；期间发生过分红/拆股的标的，窗口起点处会有一道价格「接缝」。
+`tt-rebuild`（即 `python -m trading.cli.rebuild`）一次性消除它：对 `price_basis` 为 `legacy_unknown` 的标的，用和每晚同步相同的口径重写**整段历史**。
+
+```bash
+python -m trading.cli.rebuild                      # 默认 dry-run：只抓取、比对、出报告，不写库
+python -m trading.cli.rebuild --symbol 0700.HK     # 只看某个标的
+python -m trading.cli.rebuild --apply              # 先备份受影响的全部行，再单事务写入，写后校验指纹
+python -m trading.cli.rebuild --rollback DIR       # 用备份目录原样回滚（含 create/update_time，并删除重建时新插入的日期）
+```
+
+- dry-run 报告每个标的：现有行数/日期范围、上游返回行数、价格变化的行数、变化范围与相对差异（接缝在哪、有多大）、新增日期，以及**同日期的指纹对比**（现有 → 重建后）。
+- `--apply` 需要有写权限的账号；每个标的先备份到 `--backup-dir`（默认 `./rebuild-backup-<时间戳>`，含 `manifest.json`），上游行数少于现有 90% 会拒绝（`--force` 可覆盖），写后重新读库校验指纹，不一致会提示立刻回滚。
+- 只动 `legacy_unknown` 标的；场外基金净值、已有明确口径的标的不动；上游没有的现有日期保留不删。
+- 重建的同时会为该标的建立公司行动基线，**此后**每晚同步只在出现*新的*分红/拆股时才整段重写（见下）。
+
+**每晚同步的整段重写**：复权口径（`yahoo_adjusted`）下，新的分红/拆股会让此前所有行整体平移，只重写窗口会再次留下接缝。
+`tt-fetcher` 与 MCP 的回源现在会读取 Yahoo 返回的分红/拆股事件（价格口径不变），检测到**新事件**时把该标的从最早的缓存行起整段重写；
+新事件在写成功之后才记录，写失败下次仍会重试。每个标的第一次被检测时只建基线、不触发，所以部署新版本不会在某天夜里悄悄改写历史——存量接缝交给上面的重建命令。
 
 ## Docker 镜像
 

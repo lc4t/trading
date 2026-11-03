@@ -34,10 +34,10 @@ def manager(monkeypatch, db_client):
     return mgr
 
 
-def insert_legacy(store, day, close, update_time=dt.datetime(2024, 6, 5, 0, 0)):
+def insert_legacy(store, day, close, update_time=dt.datetime(2024, 6, 5, 0, 0), symbol=SYM):
     with store.Session() as s:
         d = Decimal(str(close))
-        s.add(TradingData(symbol=SYM, date=day, open_price=d, close_price=d, high=d, low=d,
+        s.add(TradingData(symbol=symbol, date=day, open_price=d, close_price=d, high=d, low=d,
                           volume=1, create_time=update_time, update_time=update_time))
         s.commit()
 
@@ -173,7 +173,7 @@ def test_transient_db_errors_are_retried_but_others_are_not(store, monkeypatch):
 
     monkeypatch.setattr("time.sleep", lambda *_: None)
     store.upsert([make_row(SYM, D(2024, 6, 3), 1.0)], price_basis="raw")
-    real = store.Session
+    real = store.ReadSession
     state = {"fail": 2}
 
     def flaky(*a, **k):
@@ -182,7 +182,7 @@ def test_transient_db_errors_are_retried_but_others_are_not(store, monkeypatch):
             raise OperationalError("SELECT", {}, Exception(1213, "Deadlock found"))
         return real(*a, **k)
 
-    monkeypatch.setattr(store, "Session", flaky)
+    monkeypatch.setattr(store, "ReadSession", flaky)
     assert store.query_range(SYM, D(2024, 6, 1), D(2024, 6, 30))[0]["close_price"] == 1.0  # 第 3 次成功
 
     state["fail"] = 5
@@ -192,9 +192,103 @@ def test_transient_db_errors_are_retried_but_others_are_not(store, monkeypatch):
     def broken(*a, **k):
         raise OperationalError("SELECT", {}, Exception(1064, "syntax error"))
 
-    monkeypatch.setattr(store, "Session", broken)
+    monkeypatch.setattr(store, "ReadSession", broken)
     calls = []
     monkeypatch.setattr("time.sleep", lambda s: calls.append(s))
     with pytest.raises(OperationalError):
         store.query_range(SYM, D(2024, 6, 1), D(2024, 6, 30))
     assert calls == []  # 非瞬时错误不重试
+
+
+def test_pool_timeout_is_treated_as_transient(store, monkeypatch):
+    from sqlalchemy.exc import TimeoutError as PoolTimeout
+
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    store.upsert([make_row(SYM, D(2024, 6, 3), 1.0)], price_basis="raw")
+    real, state = store.ReadSession, {"fail": 1}
+
+    def exhausted(*a, **k):
+        if state["fail"]:
+            state["fail"] -= 1
+            raise PoolTimeout("QueuePool limit of size 10 overflow 20 reached")
+        return real(*a, **k)
+
+    monkeypatch.setattr(store, "ReadSession", exhausted)
+    assert store.query_range(SYM, D(2024, 6, 1), D(2024, 6, 30))[0]["close_price"] == 1.0
+
+
+# ---------------------------------------- 公司行动后 tt-fetcher 整段历史重写（复权口径）
+class YahooLegacyFake(FakeFetcher):
+    """窗口内给窗口数据，窗口从更早日期起则给「重新复权后」的整段历史。"""
+
+    def fetch(self, symbol, start, end, *, mode="raw", retry=None):
+        self.calls.append((symbol, start, end, mode))
+        rows = [dict(r) for r in self.data.get(symbol, []) if start <= r["date"] <= end]
+        from trading.market.fetchers import FetchResult
+
+        return FetchResult(rows, "yahoo_auto_adjust", "yahoo_adjusted", actions=list(self.actions.get(symbol, [])))
+
+
+@pytest.fixture
+def yahoo_manager(monkeypatch, db_client):
+    monkeypatch.setattr(data_fetcher, "DBClient", lambda: db_client)
+    mgr = data_fetcher.StockDataManager()
+    mgr.market_fetcher = YahooLegacyFake()
+    return mgr
+
+
+def _sync(mgr, start, end):
+    return mgr.fetch_data("0700.HK", start_date=start, end_date=end, db_client=mgr.db_client)
+
+
+def test_new_dividend_triggers_full_history_rewrite_but_first_sight_and_no_event_do_not(yahoo_manager, store):
+    sym = "0700.HK"
+    old = [make_row(sym, D(2024, 11, 28), 100.0), make_row(sym, D(2024, 11, 29), 101.0)]
+    new_window = [make_row(sym, D(2024, 12, 2), 50.0), make_row(sym, D(2024, 12, 3), 51.0)]
+    for r in old:
+        insert_legacy(store, r["date"], r["close_price"], dt.datetime(2024, 11, 30, 0, 0), sym)
+    yahoo_manager.market_fetcher.set_rows(sym, new_window)
+    yahoo_manager.market_fetcher.actions[sym] = [{"ex_date": D(2024, 12, 2), "kind": "dividend", "value": 2.0}]
+
+    # 第一次见到这个标的：只建基线（并记录当时已有的事件），不触发整段重写——存量接缝交给 rebuild 命令
+    assert _sync(yahoo_manager, D(2024, 12, 1), D(2024, 12, 3)) is True
+    assert [c[1] for c in yahoo_manager.market_fetcher.calls] == [D(2024, 12, 1)]
+    assert store.query_range(sym, D(2024, 11, 1), D(2024, 11, 30))[0]["close_price"] == 100.0
+
+    # 之后没有新事件：仍然只重写窗口
+    yahoo_manager.market_fetcher.calls.clear()
+    _sync(yahoo_manager, D(2024, 12, 1), D(2024, 12, 3))
+    assert len(yahoo_manager.market_fetcher.calls) == 1
+
+    # 出现新的分红：整段历史（从最早的缓存行起）一起重写，接缝消失
+    yahoo_manager.market_fetcher.calls.clear()
+    yahoo_manager.market_fetcher.set_rows(
+        sym,
+        [make_row(sym, D(2024, 11, 28), 98.0), make_row(sym, D(2024, 11, 29), 99.0)]
+        + [make_row(sym, D(2024, 12, 2), 49.0), make_row(sym, D(2024, 12, 3), 50.0)],
+    )
+    yahoo_manager.market_fetcher.actions[sym].append({"ex_date": D(2024, 12, 3), "kind": "dividend", "value": 1.0})
+    assert _sync(yahoo_manager, D(2024, 12, 1), D(2024, 12, 3)) is True
+    assert [c[1] for c in yahoo_manager.market_fetcher.calls] == [D(2024, 12, 1), D(2024, 11, 28)]
+    closes = [r["close_price"] for r in store.query_range(sym, D(2024, 11, 1), D(2024, 12, 31))]
+    assert closes == [98.0, 99.0, 49.0, 50.0]
+    # 事件已记录：下一次同步不会再次整段重写
+    yahoo_manager.market_fetcher.calls.clear()
+    _sync(yahoo_manager, D(2024, 12, 1), D(2024, 12, 3))
+    assert len(yahoo_manager.market_fetcher.calls) == 1
+
+
+def test_failed_write_keeps_the_event_pending_so_the_rewrite_is_retried(yahoo_manager, store, monkeypatch):
+    sym = "0700.HK"
+    insert_legacy(store, D(2024, 11, 28), 100.0, dt.datetime(2024, 11, 30, 0, 0), sym)
+    fake = yahoo_manager.market_fetcher
+    fake.set_rows(sym, [make_row(sym, D(2024, 11, 28), 98.0), make_row(sym, D(2024, 12, 2), 49.0)])
+    _sync(yahoo_manager, D(2024, 12, 1), D(2024, 12, 3))  # 建基线
+    fake.actions[sym] = [{"ex_date": D(2024, 12, 2), "kind": "dividend", "value": 1.0}]
+    monkeypatch.setattr(yahoo_manager, "_persist", lambda *a, **k: False)  # 模拟写库失败
+    _sync(yahoo_manager, D(2024, 12, 1), D(2024, 12, 3))
+    assert not [a for a in store.list_actions(sym) if a["kind"] == "dividend"]  # 没记录
+    monkeypatch.undo()
+    fake.calls.clear()
+    _sync(yahoo_manager, D(2024, 12, 1), D(2024, 12, 3))  # 下次仍判定为新事件，整段重写
+    assert any(c[1] == D(2024, 11, 28) for c in fake.calls)

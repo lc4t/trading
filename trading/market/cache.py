@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import math
 import re
 import threading
 import time
@@ -28,7 +29,8 @@ from .clock import (
     local_naive_to_utc,
     utcnow,
 )
-from .errors import FetchError, ReadOnlyError, RequestError
+from . import corporate
+from .errors import FetchError, RateLimited, ReadOnlyError, RequestError
 from .fetchers import RangePriceFetcher, series_type_for_symbol, upstream_route_for_symbol
 from .models import STABLE_BASES
 from .store import MarketStore
@@ -41,6 +43,8 @@ ADJUST_MODES = ("none", "qfq")
 
 DEFAULT_TAIL_CHECK_TTL = 600.0  # 尾部（缓存最新日之后）检查间隔
 DEFAULT_INTRADAY_TTL = 300.0  # 盘中非终值行的最长缓存时间
+RATE_LIMITED_ERROR = "rate_limited"  # tail_refresh_error 的固定取值：上游限流/冷却中，同时带 retry_after（秒）
+FLIGHT_WAIT_SECONDS = 90.0  # 等待同一标的正在进行的刷新的上限
 READ_ONLY_ERROR = "read_only"  # tail_refresh_error 的固定取值：数据库只读，没有回源
 DEFAULT_FAILURE_BACKOFF = 60.0  # 上游失败后的静默期
 GAP_TOLERANCE_DAYS = 10  # 超过它的日期缺口才算缺口（长假 + 周末约 9 天）
@@ -66,6 +70,17 @@ class _Outcome:
     error: Optional[str] = None
     source: Optional[str] = None
     corrected_rows: int = 0
+    retry_after: Optional[int] = None
+
+
+class _Flight:
+    """同一标的正在进行的上游刷新；并发的刷新请求挂在它上面等结果，而不是各自再打一次上游."""
+
+    def __init__(self, start: date, end: date) -> None:
+        self.start, self.end = start, end
+        self.done = threading.Event()
+        self.outcome: Optional[_Outcome] = None
+        self.exc: Optional[BaseException] = None
 
 
 class MarketCache:
@@ -89,14 +104,10 @@ class MarketCache:
         self._failure_backoff = failure_backoff
         self._tail_checked_at: Dict[str, float] = {}
         self._backoff: Dict[str, tuple[float, str]] = {}
-        self._locks: Dict[str, threading.Lock] = {}
-        self._locks_guard = threading.Lock()
+        self._flights: Dict[str, _Flight] = {}
+        self._flights_guard = threading.Lock()
 
     # ----------------------------------------------------------------- helpers
-    def _lock_for(self, symbol: str) -> threading.Lock:
-        with self._locks_guard:
-            return self._locks.setdefault(symbol, threading.Lock())
-
     @staticmethod
     def _validate_policy(refresh: str) -> None:
         if refresh not in REFRESH_POLICIES:
@@ -172,45 +183,102 @@ class MarketCache:
         return result, written
 
     def _refresh_window(self, symbol: str, start: date, end: date) -> _Outcome:
-        """抓 [start, end] 并落库；检测到新的拆分事件时让更早的历史失效并补抓."""
+        """抓 [start, end] 并落库；检测到会改写历史的新公司行动时，把更早的历史也重写."""
         if self.store.read_only:
             raise ReadOnlyError("database is read-only")
         first_cached = self.store.first_date(symbol)
         result, _ = self._fetch_and_persist(symbol, start, end)
         self._tail_checked_at[symbol] = self._monotonic()  # 刚回过源，尾部检查间隔从现在算起
         outcome = _Outcome(refreshed=True, source=result.source)
-        new_actions = self.store.record_actions(symbol, result.actions, self._now())
-        splits = [a for a in new_actions if a["kind"] == "split"]
-        if splits and first_cached is not None and first_cached < start:
-            logger.warning(f"{symbol} 检测到新的拆分事件，历史行失效并重抓")
-            outcome.corrected_rows = self.store.invalidate_before(symbol, start)
+        verdict = corporate.assess(self.store, symbol, result, self._now())
+        if verdict.trigger and first_cached is not None and first_cached < start:
+            logger.warning(f"{symbol} 检测到新的公司行动 {[(a['kind'], a['ex_date']) for a in verdict.new]}，整段历史重写")
+            if result.price_basis in STABLE_BASES:
+                outcome.corrected_rows = self.store.invalidate_before(symbol, start)  # 失败时留下「非终值」标记等下次重试
             try:
                 self._fetch_and_persist(symbol, first_cached, start - timedelta(days=1))
             except FetchError as exc:
-                outcome.error = f"split_history_refetch_failed: {exc}"
+                failed = self._error_outcome(exc)
+                outcome.error = f"history_refetch_failed: {failed.error}" if failed.retry_after is None else failed.error
+                outcome.retry_after = failed.retry_after
+                return outcome  # 新事件不记录：下次刷新仍会判定为「新」，继续重试
+        corporate.commit(self.store, symbol, verdict.new, self._now())
         return outcome
 
+    @staticmethod
+    def _error_outcome(exc: BaseException) -> _Outcome:
+        """把刷新失败翻译成对外的 tail_refresh_error（限流 / 只读 / 其它）."""
+        if isinstance(exc, RateLimited):
+            return _Outcome(error=RATE_LIMITED_ERROR, retry_after=math.ceil(exc.retry_after))
+        if isinstance(exc, ReadOnlyError):
+            return _Outcome(error=READ_ONLY_ERROR)
+        # 对外只给自己组装的 FetchError 文案；其它异常的消息可能带路径等内部细节，只暴露类型
+        message = f"{type(exc).__name__}: {exc}" if isinstance(exc, FetchError) else type(exc).__name__
+        return _Outcome(error=message)
+
     def _guarded_refresh(self, symbol: str, start: date, end: date) -> _Outcome:
-        """尾部/非终值修复用：失败不抛出，只报告；失败后进入静默期."""
+        """尾部/非终值修复用：失败不抛出，只报告；失败后进入静默期（限流另由上游冷却保护）."""
         backoff = self._backoff.get(symbol)
         if backoff and self._monotonic() < backoff[0]:
             return _Outcome(refreshed=False, error=backoff[1])
-        self._tail_checked_at[symbol] = self._monotonic()
         try:
             outcome = self._refresh_window(symbol, start, end)
-        except ReadOnlyError:
-            return _Outcome(refreshed=False, error=READ_ONLY_ERROR)
+        except (RateLimited, ReadOnlyError) as exc:
+            # 冷却中：不记 tail 检查时间，也不进失败静默期——冷却结束后第一次读取就会恢复
+            return self._error_outcome(exc)
         except Exception as exc:  # noqa: BLE001 - 上游任何失败都降级为返回缓存
             logger.warning(f"tail refresh failed for {symbol}: {type(exc).__name__}: {exc}")
-            # 对外只给自己组装的 FetchError 文案；其它异常的消息可能带路径等内部细节，只暴露类型
-            message = f"{type(exc).__name__}: {exc}" if isinstance(exc, FetchError) else type(exc).__name__
-            self._backoff[symbol] = (self._monotonic() + self._failure_backoff, message)
-            return _Outcome(refreshed=False, error=message)
+            outcome = self._error_outcome(exc)
+            self._tail_checked_at[symbol] = self._monotonic()
+            self._backoff[symbol] = (self._monotonic() + self._failure_backoff, outcome.error)
+            return outcome
+        self._tail_checked_at[symbol] = self._monotonic()
         if outcome.error:
             self._backoff[symbol] = (self._monotonic() + self._failure_backoff, outcome.error)
         else:
             self._backoff.pop(symbol, None)
         return outcome
+
+    def _plain_refresh(self, symbol: str, start: date, end: date) -> _Outcome:
+        """显式刷新 / 缓存为空时的回源：限流与只读转成 outcome，其它失败照常抛出."""
+        try:
+            return self._refresh_window(symbol, start, end)
+        except (RateLimited, ReadOnlyError) as exc:
+            return self._error_outcome(exc)
+
+    def _refresh_coalesced(self, symbol: str, start: date, end: date, *, guarded: bool) -> _Outcome:
+        """同一标的的并发刷新合并成一次（single-flight）：先到的执行，后到的等它并共享结果；
+        只有当先到者的窗口覆盖不了后到者的区间时，后到者才会在它结束后自己再刷新一次."""
+        while True:
+            with self._flights_guard:
+                flight = self._flights.get(symbol)
+                leader = flight is None
+                if leader:
+                    flight = self._flights[symbol] = _Flight(start, end)
+            if leader:
+                break
+            flight.done.wait(FLIGHT_WAIT_SECONDS)
+            if flight.done.is_set() and flight.start <= start and flight.end >= end:
+                if flight.exc is not None:
+                    if guarded:
+                        return self._error_outcome(flight.exc)
+                    raise flight.exc
+                return flight.outcome or _Outcome()
+        try:
+            outcome = (
+                self._guarded_refresh(symbol, start, end)
+                if guarded
+                else self._plain_refresh(symbol, start, end)
+            )
+            flight.outcome = outcome
+            return outcome
+        except BaseException as exc:
+            flight.exc = exc
+            raise
+        finally:
+            with self._flights_guard:
+                self._flights.pop(symbol, None)
+            flight.done.set()
 
     # ------------------------------------------------------------------ reads
     @per_symbol
@@ -234,14 +302,8 @@ class MarketCache:
         raw_rows = self.store.query_range(symbol, start, end)
 
         if refresh == "always" or (refresh == "missing" and not raw_rows):
-            with self._lock_for(symbol):
-                raw_rows = self.store.query_range(symbol, start, end)
-                if refresh == "always" or not raw_rows:
-                    try:
-                        outcome = self._refresh_window(symbol, start, end)
-                    except ReadOnlyError:
-                        outcome = _Outcome(error=READ_ONLY_ERROR)
-                    raw_rows = self.store.query_range(symbol, start, end)
+            outcome = self._refresh_coalesced(symbol, start, end, guarded=False)
+            raw_rows = self.store.query_range(symbol, start, end)
         elif refresh == "missing":
             views = [self.view(symbol, r) for r in raw_rows]
             nonfinal_from = self._nonfinal_due(symbol, views, self._now())
@@ -249,17 +311,8 @@ class MarketCache:
             tail_from = last if (last < end and self._tail_check_due(symbol)) else None
             candidates = [d for d in (nonfinal_from, tail_from) if d is not None]
             if candidates:
-                with self._lock_for(symbol):
-                    # 排队期间别的请求可能已经修复过
-                    raw_rows = self.store.query_range(symbol, start, end)
-                    views = [self.view(symbol, r) for r in raw_rows]
-                    nonfinal_from = self._nonfinal_due(symbol, views, self._now())
-                    last = max(v["date"] for v in views)
-                    tail_from = last if (last < end and self._tail_check_due(symbol)) else None
-                    candidates = [d for d in (nonfinal_from, tail_from) if d is not None]
-                    if candidates:
-                        outcome = self._guarded_refresh(symbol, min(candidates), end)
-                        raw_rows = self.store.query_range(symbol, start, end)
+                outcome = self._refresh_coalesced(symbol, min(candidates), end, guarded=True)
+                raw_rows = self.store.query_range(symbol, start, end)
 
         views = [self.view(symbol, r) for r in raw_rows]
         self._report_backoff(symbol, outcome, refresh)
@@ -278,23 +331,16 @@ class MarketCache:
         row = self.store.query_latest(symbol)
 
         if refresh == "always" or (refresh == "missing" and row is None):
-            with self._lock_for(symbol):
-                row = self.store.query_latest(symbol)
-                if refresh == "always" or row is None:
-                    try:
-                        outcome = self._refresh_window(symbol, today - timedelta(days=45), today)
-                    except ReadOnlyError:
-                        outcome = _Outcome(error=READ_ONLY_ERROR)
-                    row = self.store.query_latest(symbol)
+            outcome = self._refresh_coalesced(symbol, today - timedelta(days=45), today, guarded=False)
+            row = self.store.query_latest(symbol)
         elif refresh == "missing":
             view = self.view(symbol, row)
             nonfinal_from = self._nonfinal_due(symbol, [view], self._now())
             tail_from = view["date"] if (view["date"] < today and self._tail_check_due(symbol)) else None
             candidates = [d for d in (nonfinal_from, tail_from) if d is not None]
             if candidates:
-                with self._lock_for(symbol):
-                    outcome = self._guarded_refresh(symbol, min(candidates), today)
-                    row = self.store.query_latest(symbol)
+                outcome = self._refresh_coalesced(symbol, min(candidates), today, guarded=True)
+                row = self.store.query_latest(symbol)
 
         views = [self.view(symbol, row)] if row else []
         self._report_backoff(symbol, outcome, refresh)
@@ -335,6 +381,7 @@ class MarketCache:
             "refreshed": outcome.refreshed,
             "tail_refreshed": outcome.refreshed and refresh == "missing",
             "tail_refresh_error": outcome.error,
+            "retry_after": outcome.retry_after,
             "cache_status": (
                 "filled" if views else "empty_after_refresh" if outcome.refreshed else "empty"
             ),
