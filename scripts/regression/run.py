@@ -101,7 +101,8 @@ class Mysql:
 
 def run_py(cwd: Path, env: dict, args: list[str], log: Path) -> int:
     with log.open("w") as fh:
-        return subprocess.run(["uv", "run", "python", "-W", "ignore", *args], cwd=cwd, env=env,
+        # PYTHONPATH 指向被测代码目录：不依赖 venv 里的 editable .pth（个别环境里该文件会被同步/索引程序打上隐藏标记而被 Python 跳过）
+        return subprocess.run(["uv", "run", "python", "-W", "ignore", *args], cwd=cwd, env={**env, "PYTHONPATH": str(cwd)},
                               stdout=fh, stderr=subprocess.STDOUT).returncode
 
 
