@@ -26,7 +26,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from ..market.clock import as_of_for, business_today, is_final_snapshot, is_off_market_fund, utcnow
-from ..market.fetchers import SYNC_RETRY, RangePriceFetcher
+from ..market.errors import RateLimited
+from ..market.fetchers import REQUEST_RETRY, RangePriceFetcher
 from ..market.rows import clean_rows
 from ..market.service import fingerprint
 from ..market.store import _QUANT, MarketStore
@@ -137,7 +138,11 @@ def run(
         if i and pause:
             sleep(pause)
         try:
-            result = fetcher.fetch(symbol, item["first"], today, mode="legacy", retry=SYNC_RETRY)
+            result = fetcher.fetch(symbol, item["first"], today, mode="legacy")
+        except RateLimited as exc:
+            out(f"  上游 {exc.source} 正在限流（冷却约 {int(exc.retry_after)}s，状态与服务共享）——跳过，库未改动；稍后重跑即可")
+            failures += 1
+            continue
         except Exception as exc:  # noqa: BLE001
             out(f"  抓取失败（{type(exc).__name__}: {exc}）——跳过，库未改动")
             failures += 1
@@ -249,8 +254,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         sys.exit(rollback(store, Path(args.rollback)))
     if args.apply:
         store.ensure_meta_tables()
+    # 与服务共用同一套限流保护：读取/写入共享的冷却状态，命中限流立即放弃（不重试、不死等），避免把上游越撞越死
+    from ..market.upstream import GuardedFetcher, UpstreamGuard
+
+    fetcher = GuardedFetcher(RangePriceFetcher(retry=REQUEST_RETRY), UpstreamGuard(store=store))
     sys.exit(
-        run(store, RangePriceFetcher(retry=SYNC_RETRY), symbols=args.symbol, apply=args.apply,
+        run(store, fetcher, symbols=args.symbol, apply=args.apply,
             backup_dir=Path(args.backup_dir) if args.backup_dir else None, force=args.force, pause=args.pause)
     )
 

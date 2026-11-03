@@ -123,7 +123,9 @@ def create_mcp(
             "Cached daily stock/fund/index prices. Prefer refresh='missing'; 'latest' means the "
             "newest daily row in the cache, not a real-time quote. Every row carries as_of, "
             "fetched_at, source, is_final and price_basis: rows with is_final=false are intraday "
-            "snapshots, not closing values. Off-market funds (six-digit codes) use official unit NAV."
+            "snapshots, not closing values. Off-market funds (six-digit codes) use official unit NAV. "
+            "Upstream rate limiting is reported as rate_limited with retry_after seconds: wait that long and "
+            "retry once, never loop; cached rows are still returned meanwhile."
         ),
         host=config.host,
         port=config.port,
@@ -157,7 +159,7 @@ def create_mcp(
 
         Rows carry as_of/fetched_at/source/is_final/price_basis. adjust='qfq' returns a computed
         dividend-adjusted view (only for raw/split-adjusted series); default is the stored basis.
-        refresh='always' requires the refresh scope.
+        refresh='always' requires the refresh scope. If a result shows rate_limited (tail_refresh_error or error.code) wait retry_after seconds and retry ONCE; never loop.
         """
         return await run(
             service.price_history, symbols, _date(start_date), _date(end_date), refresh, adjust,
@@ -168,14 +170,14 @@ def create_mcp(
     async def get_latest_price(
         symbol: str, refresh: RefreshPolicy = "missing", adjust: AdjustMode = "none"
     ) -> dict[str, Any]:
-        """Return the newest cached daily row; this is not a real-time quote."""
+        """Return the newest cached daily row; this is not a real-time quote. If a result shows rate_limited (tail_refresh_error or error.code) wait retry_after seconds and retry ONCE; never loop."""
         return await run(service.latest_price, symbol, refresh, adjust, label="get_latest_price")
 
     @mcp.tool()
     async def get_fund_nav_history(
         fund_code: str, start_date: str, end_date: str, refresh: RefreshPolicy = "missing"
     ) -> dict[str, Any]:
-        """Return official unit-NAV history for a six-digit off-market fund."""
+        """Return official unit-NAV history for a six-digit off-market fund. If a result shows rate_limited (tail_refresh_error or error.code) wait retry_after seconds and retry ONCE; never loop."""
         return await run(
             service.fund_nav_history, fund_code, _date(start_date), _date(end_date), refresh,
             label="get_fund_nav_history",
@@ -185,14 +187,14 @@ def create_mcp(
     async def get_latest_fund_nav(
         fund_code: str, refresh: RefreshPolicy = "missing"
     ) -> dict[str, Any]:
-        """Return the newest cached official unit NAV for one off-market fund."""
+        """Return the newest cached official unit NAV for one off-market fund. If a result shows rate_limited (tail_refresh_error or error.code) wait retry_after seconds and retry ONCE; never loop."""
         return await run(service.latest_fund_nav, fund_code, refresh, label="get_latest_fund_nav")
 
     @mcp.tool()
     async def refresh_fund_nav_cache(
         fund_code: str, start_date: str, end_date: str
     ) -> dict[str, Any]:
-        """Fetch official unit NAV rows from upstream and record them in the cache (refresh scope)."""
+        """Fetch official unit NAV rows from upstream and record them in the cache (refresh scope). If a result shows rate_limited (tail_refresh_error or error.code) wait retry_after seconds and retry ONCE; never loop."""
         return await run(
             service.refresh_fund_nav, fund_code, _date(start_date), _date(end_date),
             label="refresh_fund_nav_cache",

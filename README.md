@@ -343,6 +343,9 @@ tool=get_price_history server_ms=2310.4 db_ops=3 db_statements=3 db_ms=96.2 upst
 | 服务自己的按 token 限流 | HTTP 429 + `Retry-After` 头（与上游限流无关） |
 | 内部错误 | `isError=true`，文本 `internal error (id=xxxxxxxx); see server logs`，`id` 与服务端日志里的堆栈一一对应；可以有上限地重试（建议 ≤2 次、带退避），重试仍失败请带上 `id` 报障 |
 
+**给通用 agent 的一句话**：看到 `rate_limited`（`tail_refresh_error` 或错误码）就**等 `retry_after` 秒再重试一次，不要循环**；仍然限流就改用返回里已有的缓存数据，或稍后再来。
+（同样的话也写在每个行情工具的描述里。）
+
 **客户端应当**：看到 `retry_after` 就**等够这么多秒再来**（可加抖动），且重试次数有上限，不要在限流期间循环重试——冷却期内每次重试都不会触达上游，只会白白得到同样的答案。
 
 ### 缓存语义
@@ -359,6 +362,19 @@ tool=get_price_history server_ms=2310.4 db_ops=3 db_statements=3 db_ms=96.2 upst
   只有全新的标的才用不复权口径；一条序列里出现多种口径时 `price_basis="mixed"`，`price_bases` 列出全部。
 - 上游失败时返回缓存并在 `tail_refresh_error` 里说明；请求路径上只做最多 2 次、间隔 ≤ 0.5s 的短重试，失败后 60 秒静默期内不再打上游。
   （`tt-fetcher` 批量同步保留历史行为：Yahoo 限流最多 10 次、30+60n 秒退避。）
+
+### 限流冷却演练
+
+`scripts/regression/ratelimit_drill.py` 真实起 `trading-mcp` 进程 + 临时 MySQL（docker）+ 本地假上游，逐步演练并**打印每一步的观察值**：
+命中限流后进入冷却且冷却期内假上游收到 0 个请求、有缓存 / 没缓存两种返回形态、冷却时长指数增长并带抖动和上限、成功后清零、
+`market_upstream_state` 在重启后保持冷却、两个实例共享冷却、同一标的并发请求合并成一次，以及（给 `--client-src` 时）AI 侧客户端是否按 `retry_after` 等待、有次数和总时长上限。
+
+```bash
+uv run python scripts/regression/ratelimit_drill.py                       # 约 4 分钟，不访问任何外部网络
+uv run python scripts/regression/ratelimit_drill.py --real-yahoo-probes 3 # 另外对真实 Yahoo 做 3 次很小量的探测
+```
+
+假上游靠一个**仅用于测试**的环境变量接入：`MCP_TEST_UPSTREAM_URL=http://127.0.0.1:<端口>`（只接受回环地址，设置后启动日志会有醒目警告；生产环境不要设置）。
 
 ## 遗留价格口径重建（`trading.cli.rebuild`）
 

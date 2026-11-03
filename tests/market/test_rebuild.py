@@ -134,3 +134,15 @@ def test_read_only_database_refuses_apply(store, tmp_path):
     store.configure_read_only()
     code, text = run(store, upstream(), tmp_path, apply=True)
     assert code == 1 and "只读" in text
+
+
+def test_rate_limited_upstream_is_reported_not_retried_and_leaves_database_untouched(store, tmp_path):
+    from trading.market.errors import RateLimited
+
+    seed(store)
+    before = table(store)
+    fake = upstream()
+    fake.fail = RateLimited("yahoo", 90)
+    code, text = run(store, fake, tmp_path, apply=True)
+    assert code == 1 and "正在限流" in text and "稍后重跑" in text and table(store) == before
+    assert len(fake.calls) == 1  # 命中限流后不重试

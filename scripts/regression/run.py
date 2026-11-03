@@ -73,7 +73,7 @@ class Mysql:
 
     def start(self):
         sh(["docker", "run", "-d", "--rm", "--name", self.name, "-p", f"127.0.0.1:{self.port}:3306",
-            "-e", f"MYSQL_ROOT_PASSWORD={self.root_pw}", "-e", "MYSQL_USER=ttuser",
+            "-e", f"MYSQL_ROOT_PASSWORD={self.root_pw}", "-e", "MYSQL_USER=reguser",
             "-e", f"MYSQL_PASSWORD={self.user_pw}", "mysql:8.4"])
         for _ in range(60):
             if subprocess.run(self._cli("select 1", root=True), capture_output=True).returncode == 0:
@@ -82,17 +82,17 @@ class Mysql:
         raise SystemExit("临时 MySQL 启动超时")
 
     def _cli(self, sql: str, root: bool = False):
-        user, pw = ("root", self.root_pw) if root else ("ttuser", self.user_pw)
+        user, pw = ("root", self.root_pw) if root else ("reguser", self.user_pw)
         return ["docker", "exec", self.name, "mysql", f"-u{user}", f"-p{pw}", "-N", "-e", sql]
 
     def query(self, sql: str) -> str:
         return subprocess.run(self._cli(sql, root=True), check=True, capture_output=True, text=True).stdout
 
     def create_db(self, name: str):
-        self.query(f"create database {name}; grant all on {name}.* to 'ttuser'@'%'")
+        self.query(f"create database {name}; grant all on {name}.* to 'reguser'@'%'")
 
     def env(self, db: str) -> dict:
-        return {**os.environ, "DB_HOST": "127.0.0.1", "DB_PORT": str(self.port), "DB_USER": "ttuser",
+        return {**os.environ, "DB_HOST": "127.0.0.1", "DB_PORT": str(self.port), "DB_USER": "reguser",
                 "DB_PASSWORD": self.user_pw, "DB_NAME": db, "TZ": "Asia/Shanghai"}
 
     def stop(self):

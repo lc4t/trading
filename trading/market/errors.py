@@ -23,9 +23,11 @@ class RateLimited(FetchError):
     ``retry_after`` 是建议调用方至少等待的秒数；冷却期内同一来源不会再发起任何上游请求.
     """
 
-    def __init__(self, source: str, retry_after: float, message: str = "") -> None:
+    def __init__(self, source: str, retry_after: float, message: str = "", hinted: bool = False) -> None:
         self.source = source
         self.retry_after = max(float(retry_after), 1.0)
+        # hinted=True 表示 retry_after 是上游明确给出的（Retry-After 头）；否则只是占位值，冷却时长由本地策略决定
+        self.hinted = hinted
         super().__init__(message or f"upstream {source} is rate limited; retry after {int(self.retry_after)}s")
 
 
