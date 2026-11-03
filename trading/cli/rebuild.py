@@ -3,10 +3,10 @@
 背景：每晚同步只重写 ``--start-date`` 之后的窗口（Yahoo 标的），更早的行停在上次抓取时的复权口径；
 期间发生过分红/拆股的标的，窗口起点处就有一道价格「接缝」。本命令一次性消除它。
 
-    python -m trading.cli.rebuild                       # dry-run：只抓取、比对、出报告，不写库
-    python -m trading.cli.rebuild --symbol 0700.HK      # 只看某个标的
-    python -m trading.cli.rebuild --apply               # 先备份受影响的行，再写入，并输出执行前后指纹
-    python -m trading.cli.rebuild --rollback DIR        # 用备份目录回滚
+    trading-mcp rebuild                       # dry-run：只抓取、比对、出报告，不写库
+    trading-mcp rebuild --symbol 0700.HK      # 只看某个标的
+    trading-mcp rebuild --apply               # 先备份受影响的行，再写入，并输出执行前后指纹
+    trading-mcp rebuild --rollback DIR        # 用备份目录回滚
 
 - 只处理 price_basis 为 legacy_unknown（没有旁表记录）的标的；场外基金净值不动。
 - 默认 dry-run；``--apply`` 才写库。写库前必先把受影响标的的 trading_data / 旁表全部行完整备份到 ``--backup-dir``。
@@ -26,7 +26,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from ..market.clock import as_of_for, business_today, is_final_snapshot, is_off_market_fund, utcnow
-from ..market.fetchers import SYNC_RETRY, RangePriceFetcher
+from ..market.errors import RateLimited
+from ..market.fetchers import REQUEST_RETRY, RangePriceFetcher
 from ..market.rows import clean_rows
 from ..market.service import fingerprint
 from ..market.store import _QUANT, MarketStore
@@ -137,7 +138,11 @@ def run(
         if i and pause:
             sleep(pause)
         try:
-            result = fetcher.fetch(symbol, item["first"], today, mode="legacy", retry=SYNC_RETRY)
+            result = fetcher.fetch(symbol, item["first"], today, mode="legacy")
+        except RateLimited as exc:
+            out(f"  上游 {exc.source} 正在限流（冷却约 {int(exc.retry_after)}s，状态与服务共享）——跳过，库未改动；稍后重跑即可")
+            failures += 1
+            continue
         except Exception as exc:  # noqa: BLE001
             out(f"  抓取失败（{type(exc).__name__}: {exc}）——跳过，库未改动")
             failures += 1
@@ -196,11 +201,11 @@ def run(
         _dump(backup_dir / "manifest.json", manifest)
         out(f"  已写入 {len(fetched)} 行；写后校验：{'通过' if ok else '失败！指纹与上游不一致'}（{after_fp[:16]} vs {expect_fp[:16]}）")
         if not ok:
-            out(f"  → 请立即回滚：python -m trading.cli.rebuild --rollback {backup_dir}")
+            out(f"  → 请立即回滚：trading-mcp rebuild --rollback {backup_dir}")
             failures += 1
 
     if apply:
-        out(f"\n清单：{backup_dir / 'manifest.json'}；回滚：python -m trading.cli.rebuild --rollback {backup_dir}")
+        out(f"\n清单：{backup_dir / 'manifest.json'}；回滚：trading-mcp rebuild --rollback {backup_dir}")
     else:
         out("\ndry-run：没有写入任何数据。确认报告无误后加 --apply 执行（会先备份）。")
     return 1 if failures else 0
@@ -224,7 +229,7 @@ def rollback(store: MarketStore, backup_dir: Path, out: Callable[[str], None] = 
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
-    ap = argparse.ArgumentParser(description="遗留价格口径重建（默认 dry-run）")
+    ap = argparse.ArgumentParser(prog="trading-mcp rebuild", description="遗留价格口径重建（默认 dry-run）")
     ap.add_argument("--symbol", action="append", default=[], help="只处理这个标的（可重复）")
     ap.add_argument("--apply", action="store_true", help="真正写库（默认只做 dry-run）")
     ap.add_argument("--backup-dir", help="备份目录，默认 ./rebuild-backup-<时间戳>")
@@ -249,8 +254,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         sys.exit(rollback(store, Path(args.rollback)))
     if args.apply:
         store.ensure_meta_tables()
+    # 与服务共用同一套限流保护：读取/写入共享的冷却状态，命中限流立即放弃（不重试、不死等），避免把上游越撞越死
+    from ..market.upstream import GuardedFetcher, UpstreamGuard
+
+    fetcher = GuardedFetcher(RangePriceFetcher(retry=REQUEST_RETRY), UpstreamGuard(store=store))
     sys.exit(
-        run(store, RangePriceFetcher(retry=SYNC_RETRY), symbols=args.symbol, apply=args.apply,
+        run(store, fetcher, symbols=args.symbol, apply=args.apply,
             backup_dir=Path(args.backup_dir) if args.backup_dir else None, force=args.force, pause=args.pause)
     )
 

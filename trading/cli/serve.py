@@ -4,6 +4,7 @@
     trading-mcp token new|rotate|list   管理配置目录里的 token（只存哈希）
     trading-mcp gen-token       生成 token 及其 sha256 配置条目（不落盘，用于 MCP_TOKENS）
     trading-mcp healthcheck     容器健康检查（非服务容器直接返回 0）
+    trading-mcp rebuild         遗留价格口径重建（默认 dry-run，见 trading.cli.rebuild）
 """
 from __future__ import annotations
 
@@ -225,6 +226,13 @@ def _serve(_: argparse.Namespace) -> int:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
+    args_list = list(sys.argv[1:] if argv is None else argv)
+    if args_list and args_list[0] == "rebuild":
+        # 参数原样转发给 trading.cli.rebuild（那里有自己的 argparse 和 --help）
+        from .rebuild import main as rebuild_main
+
+        rebuild_main(args_list[1:])
+        return
     parser = argparse.ArgumentParser(prog="trading-mcp", description="行情缓存 + 鉴权 MCP 服务")
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("serve", help="启动服务（默认）").set_defaults(func=_serve)
@@ -243,8 +251,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     tok.add_parser("list", help="列出名字和 scopes（不显示 token）")
     for p in tok.choices.values():
         p.set_defaults(func=_token_cmd)
+    sub.add_parser("rebuild", help="遗留价格口径重建（默认 dry-run；--apply 才写库）", add_help=False)
     sub.add_parser("healthcheck", help="容器健康检查").set_defaults(func=_healthcheck)
-    args = parser.parse_args(argv)
+    args = parser.parse_args(args_list)
     sys.exit((getattr(args, "func", _serve))(args))
 
 

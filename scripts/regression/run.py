@@ -66,14 +66,14 @@ def free_port() -> int:
 
 class Mysql:
     def __init__(self):
-        self.name = f"tt-regression-{secrets.token_hex(4)}"
+        self.name = f"trading-regression-{secrets.token_hex(4)}"
         self.root_pw = secrets.token_urlsafe(12)
         self.user_pw = secrets.token_urlsafe(12)
         self.port = free_port()
 
     def start(self):
         sh(["docker", "run", "-d", "--rm", "--name", self.name, "-p", f"127.0.0.1:{self.port}:3306",
-            "-e", f"MYSQL_ROOT_PASSWORD={self.root_pw}", "-e", "MYSQL_USER=ttuser",
+            "-e", f"MYSQL_ROOT_PASSWORD={self.root_pw}", "-e", "MYSQL_USER=reguser",
             "-e", f"MYSQL_PASSWORD={self.user_pw}", "mysql:8.4"])
         for _ in range(60):
             if subprocess.run(self._cli("select 1", root=True), capture_output=True).returncode == 0:
@@ -82,17 +82,17 @@ class Mysql:
         raise SystemExit("临时 MySQL 启动超时")
 
     def _cli(self, sql: str, root: bool = False):
-        user, pw = ("root", self.root_pw) if root else ("ttuser", self.user_pw)
+        user, pw = ("root", self.root_pw) if root else ("reguser", self.user_pw)
         return ["docker", "exec", self.name, "mysql", f"-u{user}", f"-p{pw}", "-N", "-e", sql]
 
     def query(self, sql: str) -> str:
         return subprocess.run(self._cli(sql, root=True), check=True, capture_output=True, text=True).stdout
 
     def create_db(self, name: str):
-        self.query(f"create database {name}; grant all on {name}.* to 'ttuser'@'%'")
+        self.query(f"create database {name}; grant all on {name}.* to 'reguser'@'%'")
 
     def env(self, db: str) -> dict:
-        return {**os.environ, "DB_HOST": "127.0.0.1", "DB_PORT": str(self.port), "DB_USER": "ttuser",
+        return {**os.environ, "DB_HOST": "127.0.0.1", "DB_PORT": str(self.port), "DB_USER": "reguser",
                 "DB_PASSWORD": self.user_pw, "DB_NAME": db, "TZ": "Asia/Shanghai"}
 
     def stop(self):
@@ -101,7 +101,8 @@ class Mysql:
 
 def run_py(cwd: Path, env: dict, args: list[str], log: Path) -> int:
     with log.open("w") as fh:
-        return subprocess.run(["uv", "run", "python", "-W", "ignore", *args], cwd=cwd, env=env,
+        # PYTHONPATH 指向被测代码目录：不依赖 venv 里的 editable .pth（个别环境里该文件会被同步/索引程序打上隐藏标记而被 Python 跳过）
+        return subprocess.run(["uv", "run", "python", "-W", "ignore", *args], cwd=cwd, env={**env, "PYTHONPATH": str(cwd)},
                               stdout=fh, stderr=subprocess.STDOUT).returncode
 
 
@@ -111,7 +112,7 @@ def main() -> int:
     ap.add_argument("--keep", action="store_true", help="结束后保留临时目录（排查差异用）")
     args = ap.parse_args()
 
-    work = Path(tempfile.mkdtemp(prefix="tt-regression-"))
+    work = Path(tempfile.mkdtemp(prefix="trading-regression-"))
     base_dir = work / "baseline"
     base_dir.mkdir()
     mysql = Mysql()

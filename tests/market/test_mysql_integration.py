@@ -1,6 +1,6 @@
 """真实 MySQL 上的端到端冒烟（伪造 fetcher）。默认跳过；用临时 MySQL 跑：
 
-    TT_TEST_MYSQL_URL='mysql+pymysql://user:pw@127.0.0.1:3306/dbname' uv run pytest tests/market/test_mysql_integration.py
+    TRADING_TEST_MYSQL_URL='mysql+pymysql://user:pw@127.0.0.1:3306/dbname' uv run pytest tests/market/test_mysql_integration.py
 
 测试会 DROP 并重建 trading_data / symbol_info / 旁表，务必只指向一次性数据库。
 """
@@ -22,8 +22,8 @@ from trading.market.store import MarketStore
 
 from .conftest import Clock, FakeFetcher, cn_time, make_row
 
-URL = os.environ.get("TT_TEST_MYSQL_URL")
-pytestmark = pytest.mark.skipif(not URL, reason="需要 TT_TEST_MYSQL_URL 指向一次性 MySQL")
+URL = os.environ.get("TRADING_TEST_MYSQL_URL")
+pytestmark = pytest.mark.skipif(not URL, reason="需要 TRADING_TEST_MYSQL_URL 指向一次性 MySQL")
 
 SYM = "159915.SZ"
 D = dt.date

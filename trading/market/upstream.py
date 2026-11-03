@@ -90,8 +90,8 @@ class UpstreamGuard:
     def _store_ok(self) -> bool:
         return self._store is not None and not getattr(self._store, "read_only", False)
 
-    def _sync_from_store(self) -> None:
-        if self._store is None or self._mono() - self._synced_at < STORE_SYNC_SECONDS:
+    def _sync_from_store(self, force: bool = False) -> None:
+        if self._store is None or (not force and self._mono() - self._synced_at < STORE_SYNC_SECONDS):
             return
         self._synced_at = self._mono()
         try:
@@ -105,9 +105,9 @@ class UpstreamGuard:
                     self._failures[source] = max(failures, self._failures.get(source, 0))
 
     # ------------------------------------------------------------------ 查询
-    def remaining(self, source: str) -> float:
-        """该来源还要冷却多少秒；0 表示可用."""
-        self._sync_from_store()
+    def remaining(self, source: str, *, fresh: bool = False) -> float:
+        """该来源还要冷却多少秒；0 表示可用。``fresh=True`` 时无视同步节流、立刻读一次旁表."""
+        self._sync_from_store(force=fresh)
         with self._lock:
             until = self._until.get(source)
         if until is None:
@@ -117,7 +117,8 @@ class UpstreamGuard:
     # ------------------------------------------------------------------ 动作
     def acquire(self, source: str) -> None:
         """发上游请求前调用：冷却中抛 ``RateLimited``；否则按最小间隔排队（有上限）."""
-        left = self.remaining(source)
+        # 马上要发上游请求了：此时多读一次旁表很便宜，换来别的实例刚触发的冷却立刻生效
+        left = self.remaining(source, fresh=True)
         if left > 0:
             raise RateLimited(source, math.ceil(left), f"upstream {source} is cooling down after rate limiting")
         policy = self._policy(source)
@@ -181,7 +182,7 @@ class GuardedFetcher:
         try:
             result = self.inner.fetch(symbol, start, end, mode=mode, retry=retry)
         except RateLimited as exc:
-            seconds = self.guard.trip(source, exc.retry_after if exc.retry_after > 1 else None)
+            seconds = self.guard.trip(source, exc.retry_after if exc.hinted else None)
             raise RateLimited(source, math.ceil(seconds)) from exc
         except FetchError:
             raise

@@ -292,3 +292,34 @@ def test_http_contract_for_rate_limited_responses(stack, clock):
         assert json.loads(empty["content"][0]["text"])["error"]["code"] == "rate_limited"
         latest = call({"symbol": "MSFT"}, name="get_latest_price")
         assert latest["isError"] and latest["structuredContent"]["error"]["code"] == "rate_limited"
+
+
+def test_placeholder_retry_after_is_not_mistaken_for_an_upstream_hint(clock):
+    """Yahoo / 同花顺 / 无头的 429 没有真实的 Retry-After，retry_after 只是占位值，冷却时长必须由本地策略决定."""
+    guard = make_guard(clock)
+
+    class Inner:
+        def __init__(self, exc):
+            self.exc = exc
+
+        def fetch(self, *a, **k):
+            raise self.exc
+
+    with pytest.raises(RateLimited) as plain:
+        GuardedFetcher(Inner(RateLimited("yahoo", 120.0)), guard).fetch("AAPL", D(2024, 6, 3), D(2024, 6, 4))
+    assert plain.value.retry_after == pytest.approx(100, abs=1)  # 基准 100s，而不是被占位的 120 顶上去
+
+    guard2 = make_guard(Clock(cn_time(2024, 6, 5, 10)))
+    with pytest.raises(RateLimited) as hinted:
+        GuardedFetcher(Inner(RateLimited("yahoo", 400.0, hinted=True)), guard2).fetch("AAPL", D(2024, 6, 3), D(2024, 6, 4))
+    assert hinted.value.retry_after == pytest.approx(400, abs=1)  # 上游明确给了 Retry-After：以它为下限
+
+
+def test_acquire_reads_shared_state_fresh_so_other_instances_cooldown_applies_immediately(store, clock):
+    a = make_guard(clock, store=store)
+    b = make_guard(clock, store=store)
+    b.acquire("yahoo")  # B 刚同步过，节流窗口内
+    a.trip("yahoo")
+    clock.advance(seconds=1)  # 远小于 5s 的同步间隔
+    with pytest.raises(RateLimited):
+        b.acquire("yahoo")  # 发上游请求前必读一次旁表，不用等节流窗口

@@ -24,6 +24,7 @@ from loguru import logger
 from .clock import is_off_market_fund
 import random
 
+from . import testing_upstream
 from .errors import FetchError, RateLimited
 
 EASTMONEY_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
@@ -108,7 +109,7 @@ def _request_with_retry(get: Any, url: str, retry: RetryPolicy, **kwargs: Any) -
             status = getattr(getattr(exc, "response", None), "status_code", None)
             if status == 429:
                 after = _retry_after_seconds(getattr(exc.response, "headers", None))
-                raise RateLimited("upstream", after or 60.0, "upstream HTTP 429") from exc
+                raise RateLimited("upstream", after or 60.0, "upstream HTTP 429", hinted=after is not None) from exc
             last = exc
             if attempt < retry.attempts - 1:
                 time.sleep(retry.delay(attempt))
@@ -161,7 +162,7 @@ class RangePriceFetcher:
         try:
             response = _request_with_retry(
                 requests.get,
-                EASTMONEY_URL,
+                testing_upstream.endpoint(EASTMONEY_URL, "/eastmoney/kline"),
                 retry,
                 params=params,
                 headers={"User-Agent": "trading-market/1.0"},
@@ -221,7 +222,7 @@ class RangePriceFetcher:
             for page in range(1, MAX_NAV_PAGES + 1):
                 response = _request_with_retry(
                     requests.get,
-                    EASTMONEY_FUND_NAV_URL,
+                    testing_upstream.endpoint(EASTMONEY_FUND_NAV_URL, "/eastmoney/lsjz"),
                     retry,
                     params={
                         "fundCode": symbol,
@@ -270,7 +271,9 @@ class RangePriceFetcher:
         try:
             response = _request_with_retry(
                 requests.get,
-                EASTMONEY_FUND_TREND_URL.format(symbol=symbol),
+                testing_upstream.endpoint(
+                    EASTMONEY_FUND_TREND_URL.format(symbol=symbol), f"/eastmoney/trend/{symbol}.js"
+                ),
                 retry,
                 headers={
                     "User-Agent": "trading-market/1.0",
@@ -347,7 +350,7 @@ class RangePriceFetcher:
         last: Exception | None = None
         for attempt in range(retry.attempts):
             try:
-                frame = yf.Ticker(symbol).history(**kwargs)
+                frame = (testing_upstream.ticker_class() or yf.Ticker)(symbol).history(**kwargs)
                 break
             except YFRateLimitError as exc:
                 last = exc
@@ -422,7 +425,10 @@ def ths_etf_rows(symbol: str) -> List[Dict[str, Any]]:
     import pandas as pd
 
     logger.info(f"正在获取 {symbol} 的数据（同花顺 ETF 前复权全量）")
-    data = adata.fund.market.get_market_etf(symbol.split(".")[0], k_type=1)
+    if testing_upstream.base_url():
+        data = testing_upstream.ths_frame(symbol.split(".")[0])
+    else:
+        data = adata.fund.market.get_market_etf(symbol.split(".")[0], k_type=1)
     if isinstance(data, Exception):
         # adata 在同花顺 IP 限制时返回的是 Exception 对象而不是抛出
         raise RateLimited("ths", 600.0, "THS ETF request hit the IP limit")

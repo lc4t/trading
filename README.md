@@ -268,7 +268,7 @@ docker logs trading-market    # 首次启动会在这里显示自动生成的 to
 ```bash
 # Claude Code
 claude mcp add --transport http trading-market http://localhost:8765/mcp \
-  --header "Authorization: Bearer $TT_MCP_TOKEN"
+  --header "Authorization: Bearer $TRADING_MCP_TOKEN"
 ```
 
 ```json
@@ -277,7 +277,7 @@ claude mcp add --transport http trading-market http://localhost:8765/mcp \
     "trading-market": {
       "type": "http",
       "url": "http://localhost:8765/mcp",
-      "headers": { "Authorization": "Bearer ${TT_MCP_TOKEN}" }
+      "headers": { "Authorization": "Bearer ${TRADING_MCP_TOKEN}" }
     }
   }
 }
@@ -343,6 +343,9 @@ tool=get_price_history server_ms=2310.4 db_ops=3 db_statements=3 db_ms=96.2 upst
 | 服务自己的按 token 限流 | HTTP 429 + `Retry-After` 头（与上游限流无关） |
 | 内部错误 | `isError=true`，文本 `internal error (id=xxxxxxxx); see server logs`，`id` 与服务端日志里的堆栈一一对应；可以有上限地重试（建议 ≤2 次、带退避），重试仍失败请带上 `id` 报障 |
 
+**给通用 agent 的一句话**：看到 `rate_limited`（`tail_refresh_error` 或错误码）就**等 `retry_after` 秒再重试一次，不要循环**；仍然限流就改用返回里已有的缓存数据，或稍后再来。
+（同样的话也写在每个行情工具的描述里。）
+
 **客户端应当**：看到 `retry_after` 就**等够这么多秒再来**（可加抖动），且重试次数有上限，不要在限流期间循环重试——冷却期内每次重试都不会触达上游，只会白白得到同样的答案。
 
 ### 缓存语义
@@ -360,16 +363,29 @@ tool=get_price_history server_ms=2310.4 db_ops=3 db_statements=3 db_ms=96.2 upst
 - 上游失败时返回缓存并在 `tail_refresh_error` 里说明；请求路径上只做最多 2 次、间隔 ≤ 0.5s 的短重试，失败后 60 秒静默期内不再打上游。
   （`tt-fetcher` 批量同步保留历史行为：Yahoo 限流最多 10 次、30+60n 秒退避。）
 
+### 限流冷却演练
+
+`scripts/regression/ratelimit_drill.py` 真实起 `trading-mcp` 进程 + 临时 MySQL（docker）+ 本地假上游，逐步演练并**打印每一步的观察值**：
+命中限流后进入冷却且冷却期内假上游收到 0 个请求、有缓存 / 没缓存两种返回形态、冷却时长指数增长并带抖动和上限、成功后清零、
+`market_upstream_state` 在重启后保持冷却、两个实例共享冷却、同一标的并发请求合并成一次，以及（给 `--client-src` 时）AI 侧客户端是否按 `retry_after` 等待、有次数和总时长上限。
+
+```bash
+uv run python scripts/regression/ratelimit_drill.py                       # 约 4 分钟，不访问任何外部网络
+uv run python scripts/regression/ratelimit_drill.py --real-yahoo-probes 3 # 另外对真实 Yahoo 做 3 次很小量的探测
+```
+
+假上游靠一个**仅用于测试**的环境变量接入：`MCP_TEST_UPSTREAM_URL=http://127.0.0.1:<端口>`（只接受回环地址，设置后启动日志会有醒目警告；生产环境不要设置）。
+
 ## 遗留价格口径重建（`trading.cli.rebuild`）
 
 每晚同步只重写 `--start-date` 之后的窗口（Yahoo 标的），更早的行停在上次抓取时的复权口径；期间发生过分红/拆股的标的，窗口起点处会有一道价格「接缝」。
-`tt-rebuild`（即 `python -m trading.cli.rebuild`）一次性消除它：对 `price_basis` 为 `legacy_unknown` 的标的，用和每晚同步相同的口径重写**整段历史**。
+`trading-mcp rebuild`（底层模块是 `python -m trading.cli.rebuild`）一次性消除它：对 `price_basis` 为 `legacy_unknown` 的标的，用和每晚同步相同的口径重写**整段历史**。
 
 ```bash
-python -m trading.cli.rebuild                      # 默认 dry-run：只抓取、比对、出报告，不写库
-python -m trading.cli.rebuild --symbol 0700.HK     # 只看某个标的
-python -m trading.cli.rebuild --apply              # 先备份受影响的全部行，再单事务写入，写后校验指纹
-python -m trading.cli.rebuild --rollback DIR       # 用备份目录原样回滚（含 create/update_time，并删除重建时新插入的日期）
+trading-mcp rebuild                      # 默认 dry-run：只抓取、比对、出报告，不写库
+trading-mcp rebuild --symbol 0700.HK     # 只看某个标的
+trading-mcp rebuild --apply              # 先备份受影响的全部行，再单事务写入，写后校验指纹
+trading-mcp rebuild --rollback DIR       # 用备份目录原样回滚（含 create/update_time，并删除重建时新插入的日期）
 ```
 
 - dry-run 报告每个标的：现有行数/日期范围、上游返回行数、价格变化的行数、变化范围与相对差异（接缝在哪、有多大）、新增日期，以及**同日期的指纹对比**（现有 → 重建后）。

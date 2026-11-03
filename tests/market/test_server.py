@@ -265,3 +265,15 @@ def test_internal_error_id_matches_the_logged_traceback(make_client, cache, capl
         text = call(client, READ_TOKEN, "get_latest_price", {"symbol": "159915.SZ"}).json()["result"]["content"][0]["text"]
     error_id = re.search(r"id=([0-9a-f]{8})", text).group(1)
     assert any(f"id={error_id}" in r.getMessage() and r.exc_info for r in caplog.records)
+
+
+def test_tool_descriptions_tell_agents_how_to_handle_rate_limiting(make_client):
+    with make_client() as client:
+        tools = client.post(
+            "/mcp", headers={**HEADERS, "Authorization": f"Bearer {READ_TOKEN}"}, content=json.dumps(rpc("tools/list"))
+        ).json()["result"]["tools"]
+    market = [t for t in tools if t["name"] in {"get_price_history", "get_latest_price", "get_fund_nav_history",
+                                                "get_latest_fund_nav", "refresh_fund_nav_cache"}]
+    assert len(market) == 5
+    for tool in market:
+        assert "rate_limited" in tool["description"] and "retry ONCE" in tool["description"] and "never loop" in tool["description"]

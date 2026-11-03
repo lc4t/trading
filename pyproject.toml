@@ -62,7 +62,6 @@ tt-backtest = "trading.cli.backtest:main"
 tt-fetcher = "trading.data.fetcher:main"
 tt-digest = "trading.cli.digest:main"
 trading-mcp = "trading.cli.serve:main"
-tt-rebuild = "trading.cli.rebuild:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
