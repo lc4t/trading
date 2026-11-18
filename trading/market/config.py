@@ -107,6 +107,7 @@ class ServerConfig:
     allowed_hosts: tuple[str, ...] = ()
     config_dir: str = DEFAULT_CONFIG_DIR
     read_only: bool = False
+    upstream_fallback: bool = True  # Yahoo 不可达时港股/美股改用备用上游（MCP_UPSTREAM_FALLBACK=0 关闭）
     text_content: str = "json"
     read_rate_per_min: int = 120
     refresh_rate_per_min: int = 10
@@ -184,5 +185,6 @@ def load_config(env: Optional[Mapping[str, str]] = None) -> ServerConfig:
         config_dir=env.get("MCP_CONFIG_DIR") or DEFAULT_CONFIG_DIR,
         text_content=_text_mode(env),
         read_only=(env.get("MCP_READ_ONLY") or "").strip().lower() in {"1", "true", "yes", "on"},
+        upstream_fallback=(env.get("MCP_UPSTREAM_FALLBACK") or "1").strip().lower() not in {"0", "false", "no", "off"},
         **extra,
     )

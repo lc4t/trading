@@ -23,12 +23,26 @@ from loguru import logger
 
 from .clock import is_off_market_fund
 from .errors import FetchError, RateLimited
-from .fetchers import is_china_exchange_symbol
+from .fetchers import (
+    BACKUP_EASTMONEY,
+    BACKUP_SINA,
+    BACKUP_TENCENT,
+    is_china_exchange_symbol,
+)
 
 SOURCE_YAHOO = "yahoo"
 SOURCE_EASTMONEY = "eastmoney"
 SOURCE_EASTMONEY_FUND = "eastmoney_fund"
 SOURCE_THS = "ths"
+SOURCE_SINA = "sina"
+SOURCE_TENCENT = "tencent"
+
+# 备用源 → 限流保护里的来源名。东财港股与 A 股 K 线是同一个主机（push2his），共用同一份冷却
+BACKUP_GUARD_SOURCE = {
+    BACKUP_EASTMONEY: SOURCE_EASTMONEY,
+    BACKUP_SINA: SOURCE_SINA,
+    BACKUP_TENCENT: SOURCE_TENCENT,
+}
 
 STORE_SYNC_SECONDS = 5.0
 MAX_QUEUE_WAIT = 5.0
@@ -46,6 +60,8 @@ DEFAULT_POLICIES: Dict[str, UpstreamPolicy] = {
     SOURCE_EASTMONEY: UpstreamPolicy(60.0, 900.0, 0.3),
     SOURCE_EASTMONEY_FUND: UpstreamPolicy(60.0, 900.0, 0.3),
     SOURCE_THS: UpstreamPolicy(60.0, 900.0, 1.0),
+    SOURCE_SINA: UpstreamPolicy(60.0, 900.0, 1.0),
+    SOURCE_TENCENT: UpstreamPolicy(60.0, 900.0, 1.0),
 }
 
 
@@ -187,4 +203,21 @@ class GuardedFetcher:
         except FetchError:
             raise
         self.guard.success(source)
+        return result
+
+    def has_backup(self) -> bool:
+        return hasattr(self.inner, "fetch_backup")
+
+    def fetch_backup(self, symbol: str, start, end, source: str, *, retry=None):
+        """备用源请求：同样先过冷却 / 间隔保护；命中限流就让该来源进入冷却."""
+        guard_source = BACKUP_GUARD_SOURCE[source]
+        self.guard.acquire(guard_source)
+        try:
+            result = self.inner.fetch_backup(symbol, start, end, source, retry=retry)
+        except RateLimited as exc:
+            seconds = self.guard.trip(guard_source, exc.retry_after if exc.hinted else None)
+            raise RateLimited(guard_source, math.ceil(seconds)) from exc
+        except FetchError:
+            raise
+        self.guard.success(guard_source)
         return result

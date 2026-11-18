@@ -207,7 +207,7 @@ def _serve(_: argparse.Namespace) -> int:
         _announce_bootstrap(boot)
 
     guard = UpstreamGuard(policies=_upstream_policies(), store=store)
-    cache = MarketCache(store, GuardedFetcher(RangePriceFetcher(), guard))
+    cache = MarketCache(store, GuardedFetcher(RangePriceFetcher(), guard), backup=config.upstream_fallback)
     backtests = BacktestTools(store, cache, config)
     app = create_app(config, MarketService(cache), store.ping, backtests)
 

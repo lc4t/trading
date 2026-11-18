@@ -6,6 +6,9 @@
     A 股场内 → 东财 K 线 fqt=0；港股/美股/指数 → Yahoo ``auto_adjust=False``；场外基金 → 东财官方单位净值。
 - ``legacy``：与 2.0 之前 tt-fetcher 完全一致的抓取（A 股 ETF 走同花顺前复权全量，其余走 Yahoo
     ``auto_adjust=True``），用于已有遗留行的标的，避免同一序列混入两种价格口径。
+
+港股 / 美股另有**备用源**（``fetch_backup``）：Yahoo 限流时由缓存层按 ``backup_sources`` 的顺序调用，
+口径锁与重叠日校验在 ``basis.py`` / ``cache.py``，这里只负责取数和解析。
 """
 from __future__ import annotations
 
@@ -25,12 +28,29 @@ from .clock import is_off_market_fund
 import random
 
 from . import testing_upstream
+from .basis import QFQ_TENCENT, UNADJUSTED
 from .errors import FetchError, RateLimited
 
 EASTMONEY_URL = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
 EASTMONEY_FUND_NAV_URL = "https://api.fund.eastmoney.com/f10/lsjz"
 EASTMONEY_FUND_TREND_URL = "https://fund.eastmoney.com/pingzhongdata/{symbol}.js"
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+SINA_US_URL = "https://stock.finance.sina.com.cn/usstock/api/jsonp.php/var%20_x=/US_MinKService.getDailyK"
+TENCENT_KLINE_URL = "https://web.ifzq.gtimg.cn/appstock/app/{kind}/get"
+# 备用源的请求头：探测脚本里验证过的浏览器 UA（东财/腾讯对非浏览器 UA 不一定放行）
+BACKUP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0 Safari/537.36",
+    "Accept-Encoding": "identity",
+}
+EASTMONEY_BACKUP_UT = "fa5fd1943c7b386f172d6893dbfba10b"
+
+# 备用源标识 → 它写入的价格口径
+BACKUP_EASTMONEY = "eastmoney_fqt0"
+BACKUP_SINA = "sina_us"
+BACKUP_TENCENT = "tencent_qfq"
+BACKUP_BASIS = {BACKUP_EASTMONEY: UNADJUSTED, BACKUP_SINA: UNADJUSTED, BACKUP_TENCENT: QFQ_TENCENT}
 
 LONG_NAV_SPAN_DAYS = 1100  # 超过约 3 年的净值区间直接走 trend 脚本
 MAX_NAV_PAGES = 400  # lsjz 每页 49 条，约 19600 条
@@ -55,6 +75,11 @@ REQUEST_RETRY = RetryPolicy(
 )  # 退避带抖动
 # tt-fetcher 批量同步沿用历史行为：Yahoo 限流最多 10 次、30+60*n 秒
 SYNC_RETRY = RetryPolicy(attempts=10, delay=lambda n: 30 + 60 * n)
+# 备用源：每个 HTTP 请求最多 2 次（含第一次），限流立刻放弃；上限是硬性的，调用方传更大的策略也会被截到 2
+BACKUP_MAX_ATTEMPTS = 2
+BACKUP_RETRY = RetryPolicy(
+    attempts=BACKUP_MAX_ATTEMPTS, delay=lambda n: 0.4 + 0.4 * random.random(), stop_on_rate_limit=True
+)
 
 
 @dataclass
@@ -65,6 +90,8 @@ class FetchResult:
     actions: List[Dict[str, Any]] = field(default_factory=list)
     # True 表示上游总是返回全量历史（同花顺），调用方按需裁剪窗口
     full_history: bool = False
+    # 备用源写入时由缓存层填上：{used, reason, source, price_basis, overlap, attempts}；主上游为 None
+    fallback: Optional[Dict[str, Any]] = None
 
 
 def _number(value: Any) -> Optional[float]:
@@ -82,7 +109,30 @@ def series_type_for_symbol(symbol: str) -> str:
     return FUND_NAV_SERIES if is_off_market_fund(symbol) else MARKET_PRICE_SERIES
 
 
+def overseas_kind(symbol: str) -> Optional[str]:
+    """港股 / 美股（有备用上游的两类）；指数、期货、加密货币等没有备用源."""
+    if re.fullmatch(r"\d{1,5}\.HK", symbol):
+        return "hk"
+    if re.fullmatch(r"[A-Z]{1,5}", symbol):
+        return "us"
+    return None
+
+
+def backup_sources(symbol: str) -> List[str]:
+    """Yahoo 不可达时按顺序尝试的备用源：不复权源在前；腾讯前复权只是不复权源都不可用时的最后备选."""
+    kind = overseas_kind(symbol)
+    if kind == "hk":
+        return [BACKUP_EASTMONEY, BACKUP_TENCENT]
+    if kind == "us":
+        return [BACKUP_SINA, BACKUP_EASTMONEY, BACKUP_TENCENT]
+    return []
+
+
 def upstream_route_for_symbol(symbol: str, mode: str = "raw") -> str:
+    if mode == UNADJUSTED:
+        return "backup_unadjusted_market_price"
+    if mode == QFQ_TENCENT:
+        return "backup_tencent_qfq_market_price"
     if is_off_market_fund(symbol):
         return "eastmoney_off_market_fund_nav_with_trend_fallback"
     if is_china_exchange_symbol(symbol):
@@ -402,6 +452,188 @@ class RangePriceFetcher:
         if legacy:
             return FetchResult(rows, "yahoo_auto_adjust", "yahoo_adjusted", actions=actions)
         return FetchResult(rows, "yahoo_unadjusted", "split_adjusted", actions=actions)
+
+    # ------------------------------------------------------------ 备用上游（Yahoo 不可达时）
+    def fetch_backup(
+        self, symbol: str, start: date, end: date, source: str, retry: Optional[RetryPolicy] = None
+    ) -> FetchResult:
+        """港股 / 美股的备用源；每个 HTTP 请求最多 2 次，失败给出带来源和次数的明确错误."""
+        retry = _clamp_backup_retry(retry or self.retry)
+        kind = overseas_kind(symbol)
+        if kind is None or source not in BACKUP_BASIS:
+            raise FetchError(f"{source} does not support {symbol}")
+        if source == BACKUP_EASTMONEY:
+            return self._backup_eastmoney(symbol, kind, start, end, retry)
+        if source == BACKUP_SINA:
+            if kind != "us":
+                raise FetchError("sina_us only supports US symbols")
+            return self._backup_sina_us(symbol, start, end, retry)
+        return self._backup_tencent(symbol, kind, start, end, retry)
+
+    def _backup_eastmoney(self, symbol: str, kind: str, start: date, end: date, retry: RetryPolicy) -> FetchResult:
+        """东财 K 线 fqt=0（真·不复权）。港股 ``116.<5 位代码>``；美股交易所前缀不固定，先 105（纳斯达克）再 106（纽交所）."""
+        import requests
+
+        code = symbol.split(".")[0]
+        secids = [f"116.{code.zfill(5)}"] if kind == "hk" else [f"105.{code}", f"106.{code}"]
+        lines: List[str] = []
+        for secid in secids:
+            params = {
+                "secid": secid,
+                "ut": EASTMONEY_BACKUP_UT,
+                "fields1": "f1,f2,f3,f4,f5,f6",
+                "fields2": "f51,f52,f53,f54,f55,f56,f57",
+                "klt": "101",
+                "fqt": "0",
+                "beg": start.strftime("%Y%m%d"),
+                "end": end.strftime("%Y%m%d"),
+            }
+            try:
+                response = _request_with_retry(
+                    requests.get,
+                    testing_upstream.endpoint(EASTMONEY_URL, "/eastmoney/kline"),
+                    retry,
+                    params=params,
+                    headers=BACKUP_HEADERS,
+                    timeout=15,
+                )
+            except RateLimited:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                raise _backup_error(BACKUP_EASTMONEY, retry, exc) from exc
+            try:
+                lines = (response.json().get("data") or {}).get("klines") or []
+            except (ValueError, AttributeError) as exc:
+                raise FetchError(f"{BACKUP_EASTMONEY} returned an unparsable response") from exc
+            if lines:
+                break
+        rows: List[Dict[str, Any]] = []
+        for line in lines:
+            fields = line.split(",")  # f51..f57：日期,开,收,高,低,量,额（港美股的量是股数，不是手）
+            if len(fields) < 6:
+                continue
+            try:
+                day = date.fromisoformat(fields[0])
+                if not start <= day <= end:
+                    continue
+                rows.append(
+                    _backup_row(symbol, day, fields[1], fields[3], fields[4], fields[2], fields[5], _number(fields[6]) if len(fields) > 6 else None)
+                )
+            except (ValueError, TypeError) as exc:
+                raise FetchError(f"{BACKUP_EASTMONEY} returned an unparsable row") from exc
+        return FetchResult(rows, BACKUP_EASTMONEY, UNADJUSTED)
+
+    def _backup_sina_us(self, symbol: str, start: date, end: date, retry: RetryPolicy) -> FetchResult:
+        """新浪美股日线：JSONP，一次返回全部历史（不复权），这里只截请求窗口."""
+        import requests
+
+        try:
+            response = _request_with_retry(
+                requests.get,
+                testing_upstream.endpoint(SINA_US_URL, "/sina/us"),
+                retry,
+                params={"symbol": symbol.lower(), "type": "daily"},
+                headers={**BACKUP_HEADERS, "Referer": "https://finance.sina.com.cn/"},
+                timeout=20,
+            )
+            body = response.text
+        except RateLimited:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise _backup_error(BACKUP_SINA, retry, exc) from exc
+        try:
+            payload = json.loads(body[body.index("([") + 1 : body.rindex("])") + 1])
+            rows = []
+            for item in payload:
+                day = date.fromisoformat(item["d"])
+                if start <= day <= end:
+                    rows.append(
+                        _backup_row(symbol, day, item["o"], item["h"], item["l"], item["c"], item["v"], None)
+                    )
+        except (ValueError, KeyError, TypeError) as exc:
+            raise FetchError(f"{BACKUP_SINA} returned an unparsable response") from exc
+        return FetchResult(rows, BACKUP_SINA, UNADJUSTED)
+
+    def _backup_tencent(self, symbol: str, kind: str, start: date, end: date, retry: RetryPolicy) -> FetchResult:
+        """腾讯前复权日线（只作为不复权源都失败时的备选，口径 ``qfq_tencent``，不与不复权行混写）."""
+        import requests
+
+        code = symbol.split(".")[0]
+        keys = [f"hk{code.zfill(5)}"] if kind == "hk" else [f"us{code}.OQ", f"us{code}.N"]
+        path = "hkfqkline" if kind == "hk" else "usfqkline"
+        count = min(max((date.today() - start).days, (end - start).days) + 5, 1500)
+        items: List[Any] = []
+        for key in keys:
+            try:
+                response = _request_with_retry(
+                    requests.get,
+                    testing_upstream.endpoint(TENCENT_KLINE_URL.format(kind=path), "/tencent/kline"),
+                    retry,
+                    params={"param": f"{key},day,,,{count},qfq"},
+                    headers=BACKUP_HEADERS,
+                    timeout=15,
+                )
+            except RateLimited:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                raise _backup_error(BACKUP_TENCENT, retry, exc) from exc
+            try:
+                data = ((response.json().get("data") or {}).get(key)) or {}
+            except (ValueError, AttributeError) as exc:
+                raise FetchError(f"{BACKUP_TENCENT} returned an unparsable response") from exc
+            items = data.get("qfqday") or data.get("day") or []
+            if items:
+                break
+        rows: List[Dict[str, Any]] = []
+        for item in items:  # [日期, 开, 收, 高, 低, 量, (分红说明)]
+            try:
+                day = date.fromisoformat(item[0])
+                if start <= day <= end:
+                    rows.append(_backup_row(symbol, day, item[1], item[3], item[4], item[2], item[5], None))
+            except (ValueError, TypeError, IndexError) as exc:
+                raise FetchError(f"{BACKUP_TENCENT} returned an unparsable row") from exc
+        return FetchResult(rows, BACKUP_TENCENT, QFQ_TENCENT)
+
+
+def _clamp_backup_retry(retry: RetryPolicy) -> RetryPolicy:
+    """备用源的重试上限是硬性的：最多 2 次，且限流时绝不重试."""
+    return RetryPolicy(
+        attempts=max(1, min(retry.attempts, BACKUP_MAX_ATTEMPTS)),
+        delay=retry.delay if retry.attempts <= BACKUP_MAX_ATTEMPTS else BACKUP_RETRY.delay,
+        stop_on_rate_limit=True,
+    )
+
+
+def root_cause_name(exc: BaseException) -> str:
+    """网络异常常被层层包装（requests.ConnectionError → ProtocolError → RemoteDisconnected）；取最里面一层的类名."""
+    current: BaseException = exc
+    for _ in range(6):
+        inner = next((a for a in current.args if isinstance(a, BaseException)), None) or current.__cause__
+        if inner is None or inner is current:
+            break
+        current = inner
+    return type(current).__name__
+
+
+def _backup_error(source: str, retry: RetryPolicy, exc: BaseException) -> FetchError:
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    detail = f"HTTP {status}" if status else root_cause_name(exc)
+    return FetchError(f"{source} request failed after {retry.attempts} attempt(s) ({detail})")
+
+
+def _backup_row(symbol: str, day: date, o: Any, h: Any, lo: Any, c: Any, volume: Any, amount: Optional[float]) -> Dict[str, Any]:
+    return {
+        "symbol": symbol,
+        "date": day,
+        "open_price": float(o),
+        "close_price": float(c),
+        "high": float(h),
+        "low": float(lo),
+        "volume": int(float(volume)) if volume not in {None, ""} else 0,
+        "amount": amount,
+        "change": None,
+        "change_pct": None,
+    }
 
 
 def _nav_row(symbol: str, day: date, nav: float, pct: Any) -> Dict[str, Any]:

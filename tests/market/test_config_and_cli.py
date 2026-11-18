@@ -318,3 +318,11 @@ def test_rebuild_is_a_trading_mcp_subcommand_and_old_names_are_gone(capsys):
     assert exc.value.code == 0 and "trading-mcp rebuild" in capsys.readouterr().out
     scripts = tomllib.loads((pathlib.Path(__file__).parents[2] / "pyproject.toml").read_text())["project"]["scripts"]
     assert "trading-mcp" in scripts and "tt-rebuild" not in scripts and "tt-serve" not in scripts
+
+
+def test_upstream_fallback_is_on_by_default_and_can_be_switched_off(tmp_path):
+    base = {**DB, "MCP_CONFIG_DIR": str(tmp_path)}
+    assert load_config(base).upstream_fallback is True
+    for off in ("0", "false", "off", "NO"):
+        assert load_config({**base, "MCP_UPSTREAM_FALLBACK": off}).upstream_fallback is False
+    assert load_config({**base, "MCP_UPSTREAM_FALLBACK": "1"}).upstream_fallback is True

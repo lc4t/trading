@@ -10,7 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Dict, List
 from urllib.parse import parse_qs, urlparse
 
-SOURCES = ("yahoo", "eastmoney", "eastmoney_fund", "ths")
+SOURCES = ("yahoo", "eastmoney", "eastmoney_fund", "ths", "sina", "tencent")
 
 
 def _weekdays(start: dt.date, end: dt.date) -> List[dt.date]:
@@ -87,6 +87,10 @@ class FakeUpstream:
             return "eastmoney_fund"
         if path.startswith("/ths/"):
             return "ths"
+        if path.startswith("/sina/"):
+            return "sina"
+        if path.startswith("/tencent/"):
+            return "tencent"
         return None
 
     def render(self, source: str, path: str, q: Dict[str, str]):
@@ -123,6 +127,19 @@ class FakeUpstream:
             end = min(dt.date.fromisoformat(q["endDate"]), today)
             items = [{"FSRQ": d.isoformat(), "DWJZ": str(_price(code, d)), "JZZZL": "0.1"} for d in reversed(_weekdays(start, end))][:49]
             return json.dumps({"ErrCode": 0, "Data": {"LSJZList": items}}), "application/json"
+        if source == "sina":  # 备用：新浪美股，JSONP，一次返回全部历史（含窗口外很早的行）
+            symbol = q["symbol"].upper()
+            days = _weekdays(today - dt.timedelta(days=400), today)
+            items = [{"d": d.isoformat(), "o": str(_price(symbol, d)), "h": str(_price(symbol, d) + 1), "l": str(_price(symbol, d) - 1),
+                      "c": str(_price(symbol, d)), "v": "1000"} for d in days]
+            return "var _x=(" + json.dumps(items) + ");", "text/javascript"
+        if source == "tencent":  # 备用：腾讯前复权（这里故意比不复权价低 1%，模拟已被分红复权）
+            key = q["param"].split(",")[0]
+            code = key.replace("hk", "").replace("us", "").split(".")[0].lstrip("0") or key
+            days = _weekdays(today - dt.timedelta(days=60), today)
+            items = [[d.isoformat(), str(_price(code, d) * 0.99), str(_price(code, d) * 0.99), str(_price(code, d) * 0.99 + 1),
+                      str(_price(code, d) * 0.99 - 1), "1000"] for d in days]
+            return json.dumps({"code": 0, "data": {key: {"qfqday": items}}}), "application/json"
         if source == "ths":
             code = path.rsplit("/", 1)[-1]
             rows = [
