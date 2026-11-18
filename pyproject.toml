@@ -58,10 +58,14 @@ line-length = 100
 target-version = "py313"
 
 [project.scripts]
+trading-backtest = "trading.cli.backtest:main"
+trading-fetcher = "trading.data.fetcher:main"
+trading-digest = "trading.cli.digest:main"
+trading-mcp = "trading.cli.serve:main"
+# 旧名别名（已弃用，下个大版本移除）：同一入口再登记一遍，让既有 workflow / 脚本继续可用
 tt-backtest = "trading.cli.backtest:main"
 tt-fetcher = "trading.data.fetcher:main"
 tt-digest = "trading.cli.digest:main"
-trading-mcp = "trading.cli.serve:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

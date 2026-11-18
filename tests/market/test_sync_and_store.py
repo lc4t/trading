@@ -1,4 +1,4 @@
-"""tt-fetcher 同步 / 回测取数经过统一数据层后的行为（SQLite 内存库）。"""
+"""trading-fetcher 同步 / 回测取数经过统一数据层后的行为（SQLite 内存库）。"""
 import datetime as dt
 from decimal import Decimal
 from types import SimpleNamespace
@@ -217,7 +217,7 @@ def test_pool_timeout_is_treated_as_transient(store, monkeypatch):
     assert store.query_range(SYM, D(2024, 6, 1), D(2024, 6, 30))[0]["close_price"] == 1.0
 
 
-# ---------------------------------------- 公司行动后 tt-fetcher 整段历史重写（复权口径）
+# ---------------------------------------- 公司行动后 trading-fetcher 整段历史重写（复权口径）
 class YahooLegacyFake(FakeFetcher):
     """窗口内给窗口数据，窗口从更早日期起则给「重新复权后」的整段历史。"""
 
