@@ -4,7 +4,7 @@
 
 - ``raw``：不复权/仅拆分调整的原始价，历史行不会因分红而改变。
     A 股场内 → 东财 K 线 fqt=0；港股/美股/指数 → Yahoo ``auto_adjust=False``；场外基金 → 东财官方单位净值。
-- ``legacy``：与 2.0 之前 tt-fetcher 完全一致的抓取（A 股 ETF 走同花顺前复权全量，其余走 Yahoo
+- ``legacy``：与 2.0 之前 trading-fetcher 完全一致的抓取（A 股 ETF 走同花顺前复权全量，其余走 Yahoo
     ``auto_adjust=True``），用于已有遗留行的标的，避免同一序列混入两种价格口径。
 
 港股 / 美股另有**备用源**（``fetch_backup``）：Yahoo 限流时由缓存层按 ``backup_sources`` 的顺序调用，
@@ -73,7 +73,7 @@ class RetryPolicy:
 REQUEST_RETRY = RetryPolicy(
     attempts=2, delay=lambda n: 0.4 + 0.4 * random.random(), stop_on_rate_limit=True
 )  # 退避带抖动
-# tt-fetcher 批量同步沿用历史行为：Yahoo 限流最多 10 次、30+60*n 秒
+# trading-fetcher 批量同步沿用历史行为：Yahoo 限流最多 10 次、30+60*n 秒
 SYNC_RETRY = RetryPolicy(attempts=10, delay=lambda n: 30 + 60 * n)
 # 备用源：每个 HTTP 请求最多 2 次（含第一次），限流立刻放弃；上限是硬性的，调用方传更大的策略也会被截到 2
 BACKUP_MAX_ATTEMPTS = 2
@@ -359,7 +359,7 @@ class RangePriceFetcher:
 
     # -------------------------------------------------------------------- ths
     def fetch_ths_etf(self, symbol: str) -> FetchResult:
-        """同花顺 ETF 日线（前复权，全量历史，忽略区间）——历史 tt-fetcher 的抓取方式."""
+        """同花顺 ETF 日线（前复权，全量历史，忽略区间）——历史 trading-fetcher 的抓取方式."""
         try:
             rows = ths_etf_rows(symbol)
         except FetchError:

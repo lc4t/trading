@@ -17,8 +17,8 @@
 .
 ├── trading/                # Python 包
 │   ├── api.py                  # 用户态门面 run_backtest / MomentumBasket / ...
-│   ├── data/                   # 数据仓库（MySQL）+ fetcher（tt-fetcher）
-│   ├── market/                 # 行情缓存层：抓取 / 缓存 / 元数据，tt-fetcher、回测、MCP 共用
+│   ├── data/                   # 数据仓库（MySQL）+ fetcher（trading-fetcher）
+│   ├── market/                 # 行情缓存层：抓取 / 缓存 / 元数据，trading-fetcher、回测、MCP 共用
 │   ├── strategies/             # base / signals / dual_ma / momentum / momentum_rotation
 │   ├── engine/                 # single / multi / sweep
 │   ├── analysis/               # metrics / report
@@ -60,6 +60,20 @@ uv run python -m trading.cli.backtest 159915.SZ \
   --use-chandelier --chandelier-multiplier 1.5 --chandelier-period 15 \
   --output-json data/159915.SZ.json
 ```
+
+### 命令行入口
+
+`uv sync` / 镜像里安装的控制台命令（镜像内在 `/app/.venv/bin/`）：
+
+| 命令 | 入口 | 等价的模块写法 |
+| ---- | ---- | ---- |
+| `trading-fetcher` | `trading.data.fetcher:main` | `python -m trading.cli.fetcher` |
+| `trading-backtest` | `trading.cli.backtest:main` | `python -m trading.cli.backtest` |
+| `trading-digest` | `trading.cli.digest:main` | `python -m trading.cli.digest` |
+| `trading-mcp` | `trading.cli.serve:main` | `python -m trading.cli.serve` |
+
+**已弃用的别名**：`tt-fetcher`、`tt-backtest`、`tt-digest` 是上面三个 `trading-*` 命令的旧名，指向同一个入口函数，行为完全一致，
+只为让现有 workflow / 脚本不用改也不会坏；**下个大版本移除**，请尽快改用新名。`python -m trading.cli.xxx` 的模块写法不受影响。
 
 ## 交易信号日报
 
@@ -375,7 +389,7 @@ Yahoo 能用时仍然首选 Yahoo。指数（`^HSI`、`000300.SS`）、期货、
 | `split_adjusted`（Yahoo 新写入的港美股序列）、`raw` 等 | 拒绝（拆股后不复权价与拆股调整价不同） | 拒绝 |
 
 备用源只**追加尾部**：口径不同的序列只写「最后一个已定稿行」**之后**的行，那一行和更早的历史原样不动，追加的行记自己的 `price_basis` / `source`（所以一条序列里会出现 `price_basis="mixed"`，返回里如实列出）。
-一条序列已经是 `unadjusted` / `qfq_tencent` 之后，后续回源**沿用备用源、不再去碰 Yahoo**（Yahoo 的调整价接不上去）；要回到 Yahoo 口径，对每晚流水线覆盖的标的（如 `0700.HK`）下一次 `tt-fetcher` 同步会按 Yahoo 口径重写窗口并自然恢复，
+一条序列已经是 `unadjusted` / `qfq_tencent` 之后，后续回源**沿用备用源、不再去碰 Yahoo**（Yahoo 的调整价接不上去）；要回到 Yahoo 口径，对每晚流水线覆盖的标的（如 `0700.HK`）下一次 `trading-fetcher` 同步会按 Yahoo 口径重写窗口并自然恢复，
 不在流水线里的标的需要人工重建（`trading-mcp rebuild` 目前只处理遗留行，不处理这类序列）。
 
 **重叠日校验**（`trading.market.basis.overlap_check` / `check_overlap_rows`）：取备用源与库中**最后一个已定稿行的同一天**的收盘价，相对差必须 ≤ **0.01%**（`OVERLAP_TOLERANCE = 1e-4`；
@@ -428,7 +442,7 @@ Yahoo 能用时仍然首选 Yahoo。指数（`^HSI`、`000300.SS`）、期货、
   Yahoo 标的是 `auto_adjust` 价）。为避免同一序列混入两种口径，**已有历史行的标的继续沿用历史抓取方式**（`ths_qfq` / `yahoo_adjusted`），
   只有全新的标的才用不复权口径；一条序列里出现多种口径时 `price_basis="mixed"`，`price_bases` 列出全部。
 - 上游失败时返回缓存并在 `tail_refresh_error` 里说明；请求路径上只做最多 2 次、间隔 ≤ 0.5s 的短重试，失败后 60 秒静默期内不再打上游。
-  （`tt-fetcher` 批量同步保留历史行为：Yahoo 限流最多 10 次、30+60n 秒退避。）
+  （`trading-fetcher` 批量同步保留历史行为：Yahoo 限流最多 10 次、30+60n 秒退避。）
 
 ### 限流冷却演练
 
@@ -463,7 +477,7 @@ trading-mcp rebuild --rollback DIR       # 用备份目录原样回滚（含 cre
 - 重建的同时会为该标的建立公司行动基线，**此后**每晚同步只在出现*新的*分红/拆股时才整段重写（见下）。
 
 **每晚同步的整段重写**：复权口径（`yahoo_adjusted`）下，新的分红/拆股会让此前所有行整体平移，只重写窗口会再次留下接缝。
-`tt-fetcher` 与 MCP 的回源现在会读取 Yahoo 返回的分红/拆股事件（价格口径不变），检测到**新事件**时把该标的从最早的缓存行起整段重写；
+`trading-fetcher` 与 MCP 的回源现在会读取 Yahoo 返回的分红/拆股事件（价格口径不变），检测到**新事件**时把该标的从最早的缓存行起整段重写；
 新事件在写成功之后才记录，写失败下次仍会重试。每个标的第一次被检测时只建基线、不触发，所以部署新版本不会在某天夜里悄悄改写历史——存量接缝交给上面的重建命令。
 
 ## Docker 镜像
@@ -486,6 +500,7 @@ ghcr.io/lc4t/trading-<branch>:latest
 | `/app/.venv/` | 构建时安装好的虚拟环境 |
 | `/app/{backtest,fetcher}.py` | 向后兼容的 CLI shim |
 | `/app/.venv/bin/trading-mcp` | 行情缓存 + MCP 服务入口（见上一节），与回测/同步共用同一镜像 |
+| `/app/.venv/bin/trading-{fetcher,backtest,digest}` | 同步 / 回测 / 日报入口（旧名 `tt-*` 为已弃用别名，下个大版本移除） |
 | ~~`/app/frontend/`~~ | **不打入镜像**——前端独立部署 |
 
 ## 测试

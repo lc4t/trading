@@ -1,6 +1,6 @@
 """trading_data + 元数据旁表的统一读写层.
 
-回测引擎取数、tt-fetcher 同步、MCP 服务三者都经过这里。``trading_data`` 的列语义不变；
+回测引擎取数、trading-fetcher 同步、MCP 服务三者都经过这里。``trading_data`` 的列语义不变；
 元数据（价格口径 / 来源 / 数据时点 / 终值标记）写在 ``market_data_meta`` 旁表。
 """
 from __future__ import annotations
@@ -104,7 +104,7 @@ class MarketStore:
             install_statement_counter(self.read_engine)
         self._insert = _insert_for(engine)
         # 旁表建不出来（例如 DB 账号没有 DDL 权限）时降级为只写 trading_data，
-        # 保证 tt-fetcher 每日同步不受影响；MCP 服务启动时则要求必须可用。
+        # 保证 trading-fetcher 每日同步不受影响；MCP 服务启动时则要求必须可用。
         self.meta_enabled = True
         # 只读：账号没有写权限（显式配置或运行时探测到）。读照常，写一律拒绝
         self.read_only = False
@@ -132,7 +132,7 @@ class MarketStore:
         Base.metadata.create_all(self.engine)
 
     def ensure_meta_tables(self) -> bool:
-        """尽力建旁表；失败则关闭元数据功能并返回 False（tt-fetcher 用）."""
+        """尽力建旁表；失败则关闭元数据功能并返回 False（trading-fetcher 用）."""
         try:
             for table in META_TABLES:
                 table.create(self.engine, checkfirst=True)

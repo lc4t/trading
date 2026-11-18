@@ -1,6 +1,6 @@
 """每次工具调用的服务端耗时统计：总耗时、DB 往返/累计毫秒、上游回源次数/毫秒、逐标的明细.
 
-用 ContextVar 把统计对象带进线程池里的同步代码；没有统计对象时（tt-fetcher 等）所有记录都是空操作。
+用 ContextVar 把统计对象带进线程池里的同步代码；没有统计对象时（trading-fetcher 等）所有记录都是空操作。
 """
 from __future__ import annotations
 

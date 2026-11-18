@@ -1,4 +1,4 @@
-"""用固定的虚构上游数据驱动 tt-fetcher 的 main()，不访问网络。
+"""用固定的虚构上游数据驱动 trading-fetcher 的 main()，不访问网络。
 
     python sync_mock.py 159915.SZ   # 同花顺格式（A 股 ETF，前复权全量）
     python sync_mock.py 000300.SS   # Yahoo 格式（auto_adjust 路径）
@@ -57,7 +57,7 @@ class FakeTicker:
 
 
 symbol = sys.argv[1]
-sys.argv = ["tt-fetcher", "--symbol", symbol, "--start-date", "2024-12-01", "--end-date", "2026-10-30"]
+sys.argv = ["trading-fetcher", "--symbol", symbol, "--start-date", "2024-12-01", "--end-date", "2026-10-30"]
 with mock.patch.object(adata.fund.market, "get_market_etf", return_value=ths_frame(sum(map(ord, symbol)))), \
         mock.patch("yfinance.Ticker", FakeTicker):
     from trading.data.fetcher import main
