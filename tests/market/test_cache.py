@@ -60,7 +60,7 @@ def test_coverage_info_internal_and_tail_gaps():
 # ------------------------------------------------------- 盘中行 / as_of / is_final
 def test_intraday_row_is_marked_nonfinal_with_snapshot_as_of(cache, fetcher, clock):
     seed_upstream(fetcher, {D(2024, 6, 4): 1.1, D(2024, 6, 5): 1.15})
-    payload = cache.get_range(SYM, D(2024, 6, 4), D(2024, 6, 5))
+    payload = cache.get_range(SYM, D(2024, 6, 4), D(2024, 6, 5), intraday=True)
     done, today = payload["data"]
     assert done["is_final"] is True and today["is_final"] is False
     assert today["as_of"] == clock.now  # 盘中：数据时点 = 抓取时刻
@@ -74,7 +74,7 @@ def test_intraday_row_is_marked_nonfinal_with_snapshot_as_of(cache, fetcher, clo
 def test_intraday_row_corrected_next_day_even_when_end_equals_cached_latest(cache, fetcher, clock):
     """回归：盘中抓到的当日行，次日请求 end=昨天时必须被修正成收盘价."""
     seed_upstream(fetcher, {D(2024, 6, 4): 1.1, D(2024, 6, 5): 1.15})  # 15 = 盘中价
-    cache.get_range(SYM, D(2024, 6, 4), D(2024, 6, 5))
+    cache.get_range(SYM, D(2024, 6, 4), D(2024, 6, 5), intraday=True)
     assert len(fetcher.calls) == 1
 
     clock.now = cn_time(2024, 6, 6, 9, 0)  # 次日
@@ -94,19 +94,19 @@ def test_intraday_row_corrected_next_day_even_when_end_equals_cached_latest(cach
 
 def test_intraday_row_respects_ttl_while_market_is_open(cache, fetcher, clock):
     seed_upstream(fetcher, {D(2024, 6, 5): 1.0})
-    cache.get_range(SYM, D(2024, 6, 5), D(2024, 6, 5))
+    cache.get_range(SYM, D(2024, 6, 5), D(2024, 6, 5), intraday=True)
     clock.advance(seconds=120)
-    cache.get_range(SYM, D(2024, 6, 5), D(2024, 6, 5))
+    cache.get_range(SYM, D(2024, 6, 5), D(2024, 6, 5), intraday=True)
     assert len(fetcher.calls) == 1  # TTL 内不重抓
     clock.advance(seconds=300)
-    cache.get_range(SYM, D(2024, 6, 5), D(2024, 6, 5))
+    cache.get_range(SYM, D(2024, 6, 5), D(2024, 6, 5), intraday=True)
     assert len(fetcher.calls) == 2  # 超过 TTL 重抓
 
 
 def test_fetch_just_after_close_inside_buffer_is_not_final(cache, fetcher, clock):
     clock.now = cn_time(2024, 6, 5, 15, 10)  # 收盘后 10 分钟，缓冲期内
     seed_upstream(fetcher, {D(2024, 6, 5): 1.0})
-    payload = cache.get_range(SYM, D(2024, 6, 5), D(2024, 6, 5))
+    payload = cache.get_range(SYM, D(2024, 6, 5), D(2024, 6, 5), intraday=True)
     assert payload["data"][0]["is_final"] is False
     clock.now = cn_time(2024, 6, 5, 15, 40)
     cache.get_range(SYM, D(2024, 6, 5), D(2024, 6, 5))
@@ -116,7 +116,7 @@ def test_fetch_just_after_close_inside_buffer_is_not_final(cache, fetcher, clock
 
 def test_refresh_never_does_not_fetch_even_for_nonfinal(cache, fetcher, clock):
     seed_upstream(fetcher, {D(2024, 6, 5): 1.0})
-    cache.get_range(SYM, D(2024, 6, 5), D(2024, 6, 5))
+    cache.get_range(SYM, D(2024, 6, 5), D(2024, 6, 5), intraday=True)
     clock.now = cn_time(2024, 6, 7, 9, 0)
     payload = cache.get_range(SYM, D(2024, 6, 5), D(2024, 6, 5), refresh="never")
     assert len(fetcher.calls) == 1
@@ -134,7 +134,7 @@ def test_refresh_always_refetches_window(cache, fetcher, clock):
 
 def test_latest_repairs_nonfinal_row(cache, fetcher, clock):
     seed_upstream(fetcher, {D(2024, 6, 5): 1.0})
-    first = cache.get_latest(SYM)
+    first = cache.get_latest(SYM, intraday=True)
     assert first["data"]["is_final"] is False
     clock.now = cn_time(2024, 6, 6, 8, 0)
     seed_upstream(fetcher, {D(2024, 6, 5): 1.3})
@@ -308,6 +308,7 @@ def test_invalid_inputs(cache):
 
 def test_fund_nav_rows_are_always_final(cache, fetcher, clock):
     code = "005698"
+    clock.now = cn_time(2024, 6, 5, 20, 0)  # 净值要等收盘后才有当日行
     fetcher.set_rows(code, [make_row(code, D(2024, 6, 5), 1.5)])
     payload = cache.get_range(code, D(2024, 6, 5), D(2024, 6, 5))
     assert payload["data"][0]["is_final"] is True

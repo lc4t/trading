@@ -33,6 +33,7 @@ class FakeUpstream:
         self.retry_after_header: Dict[str, str] = {}
         self.hits: Counter = Counter()
         self.log: List[tuple] = []
+        self.today = dt.date.today()  # 假上游认为的「今天」：演练里要和被测服务的假时钟对齐
         self._lock = threading.Lock()
         outer = self
 
@@ -50,7 +51,7 @@ class FakeUpstream:
                     return
                 with outer._lock:
                     outer.hits[source] += 1
-                    outer.log.append((time.time(), source, url.path))
+                    outer.log.append((time.time(), source, self.path))
                 if outer.delay[source]:
                     time.sleep(outer.delay[source])
                 if outer.mode[source] == "limit":
@@ -89,7 +90,7 @@ class FakeUpstream:
         return None
 
     def render(self, source: str, path: str, q: Dict[str, str]):
-        today = dt.date.today()
+        today = self.today
         if source == "yahoo":
             symbol = path.rsplit("/", 1)[-1]
             start = dt.date.fromisoformat(q["start"][:10])

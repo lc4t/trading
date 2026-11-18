@@ -352,8 +352,19 @@ tool=get_price_history server_ms=2310.4 db_ops=3 db_statements=3 db_ms=96.2 upst
 
 - **已定稿的历史日线只读，不再回源**。缓存没覆盖的区间不会静默补抓，而是在 `coverage`（`gaps` 列表）里暴露；要补就显式 `refresh=always`。
 - **当日数据允许缓存，但必须带时点**：只有抓取时刻晚于该交易日收盘 + 30 分钟才标 `is_final=true`，`as_of` = 当日收盘时刻；
-  盘中抓到的行 `is_final=false`、`as_of` = 抓取时刻。`is_final=false` 的行每次读取都按 TTL（默认 5 分钟）判断是否重抓，
-  收盘后必重抓——**即使请求的 `end` 恰好等于缓存里最新的一天**。时钟以 Asia/Shanghai 业务日为准，收盘时间按标的所在交易所（A 股 15:00、港股 16:10、美股 16:00 ET）。
+  盘中抓到的行 `is_final=false`、`as_of` = 抓取时刻。时钟以标的**所在市场**的交易所时区为准（A 股与场外基金 15:00、港股 16:10、美股 16:00 ET，均加 30 分钟缓冲），响应里的时间一律换算成北京时间。
+- **三种时间窗口各自的行为**（对每个标的，看「所在市场的当日交易日」）：
+
+  | 窗口 | `intraday=false`（默认） | 备注 |
+  | ---- | ---- | ---- |
+  | ① **收盘前**（当前时刻早于当日 `final_ready_at` = 收盘 + 30 分钟） | **不对当日这一行请求上游**，因此也不会触发限流冷却；返回已有的最新定稿行（不含当日盘中快照），`cache[symbol].awaiting_close = {"date", "final_ready_at"(北京时间 ISO8601), "wait_seconds"}`，`tail_refresh_error` 保持 `null`（这不是错误）。`get_latest_*` 在顶层带同样的 `awaiting_close`，外加一句可读说明（还要等多久才能拿到当日收盘价）。只请求当日且没有更早的行时返回结构化错误 `error.code="awaiting_close"`（带 `wait_seconds`） | 回源窗口只到**前一天**：没缓存的标的照常补历史，但绝不碰当日 |
+  | ② **收盘 + 缓冲之后、当晚流水线入库之前** | **需要回源**，且过了 `final_ready_at` 之后的**第一次请求就会回源**（不必等 10 分钟的尾部检查间隔），拿到的行直接是 `is_final=true` | A 股 / 场外基金走东财、同花顺；**港股、美股在目前的部署里走 Yahoo，出口 IP 被限流时会得到 `rate_limited` + `retry_after`——这是已知缺口，等备选上游落地**。流水线每晚在北京时间约 03:30 ~ 07:30 运行，所以港股在 16:40 到次日约 07:30 之间属于这一窗口；美股收盘约在北京时间 04:00 ~ 05:00（夏令 / 冬令），可能早于流水线，是否落在这一窗口取决于**当晚流水线是否覆盖该标的** |
+  | ③ **入库之后**（该日已有 `is_final=true` 的行） | **读缓存，永不回源** | 流水线或前一次回源写入的定稿行不会再被刷新；`refresh=never` 同样 |
+
+  `refresh=always` 是显式强制回源：收盘前同样只刷新到前一天，不会去拉当日的盘中行。
+- **盘中值是显式选项**：`get_price_history` / `get_latest_price` 的参数 `intraday`（默认 `false`）。`intraday=true` 时保持旧行为——按 TTL（默认 5 分钟）回源，行带 `is_final=false`、`as_of` = 抓取时刻，不返回 `awaiting_close`。
+  > **行为变更（默认值）**：之前收盘前请求当日数据会去上游抓盘中行并存成 `is_final=false`；现在默认**不抓、也不返回**盘中行。需要旧行为的调用方显式传 `intraday=true`。
+- **已知边界**：交易日只按周末判断（周六日不是交易日，不套用「等收盘」）；**没有节假日日历**——工作日的节假日会被当成交易日，`awaiting_close` 会多说一句，不影响数据，过了 `final_ready_at` 之后上游没有当日行就是没有（同一时间窗口里只会回源一次）。场外基金按 A 股 15:00 + 30 分钟计，实际净值通常晚上才公布，窗口 ② 里可能取不到当日净值。
 - **价格口径 `price_basis`**：新标的写入不复权价（A 股场内 → 东财 `fqt=0`，`raw`；港股美股指数 → Yahoo `auto_adjust=False`，`split_adjusted`，仅拆分调整；场外基金 → 官方单位净值 `raw`）。
   分红/拆分事件另存 `market_corporate_actions`：检测到新的拆分时，受影响的历史行自动失效并重抓；`adjust="qfq"` 用已记录的分红即时计算前复权视图（不落库，返回里 `price_view=adjusted_qfq`）。
   **不再用分红额扣减历史价**。
@@ -375,6 +386,7 @@ uv run python scripts/regression/ratelimit_drill.py --real-yahoo-probes 3 # 另�
 ```
 
 假上游靠一个**仅用于测试**的环境变量接入：`MCP_TEST_UPSTREAM_URL=http://127.0.0.1:<端口>`（只接受回环地址，设置后启动日志会有醒目警告；生产环境不要设置）。
+演练里还有一段「收盘前不回源」（`--only-awaiting-close` 可单独跑，约 1 分钟）：用仅测试的 `MCP_TEST_NOW=<ISO 时刻>`（必须同时设置了 `MCP_TEST_UPSTREAM_URL`）把服务的时钟拨到收盘前 30 秒并让它继续走，观察收盘前假上游收到 0 个请求、`awaiting_close` 的字段值、过了 `final_ready_at` 之后才回源、定稿后永不回源。
 
 ## 遗留价格口径重建（`trading.cli.rebuild`）
 
