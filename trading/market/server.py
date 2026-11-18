@@ -30,7 +30,7 @@ from .auth import (
 from .config import ServerConfig
 from .errors import FetchError, RequestError
 from . import timing
-from .service import MarketService, NoDataError, RateLimitedError
+from .service import MarketService, NoDataError, StructuredNoData
 
 logger = logging.getLogger("trading.market.server")
 
@@ -138,7 +138,7 @@ def create_mcp(
     async def run(fn: Callable[..., Any], *args: Any, label: Optional[str] = None) -> Any:
         try:
             return _package(await _run(fn, *args, label=label), config.text_content)
-        except RateLimitedError as exc:
+        except StructuredNoData as exc:
             # 结构化错误：isError=true，但 structuredContent.error.code / retry_after 让客户端知道要等多久，
             # 而不是收到一个泛化异常就立刻重试
             body = exc.body()
@@ -154,24 +154,31 @@ def create_mcp(
         end_date: str,
         refresh: RefreshPolicy = "missing",
         adjust: AdjustMode = "none",
+        intraday: bool = False,
     ) -> dict[str, Any]:
         """Return inclusive daily OHLCV history for stocks, funds, or indices.
+
+        By default today's row is NOT returned until that market has closed (cache[symbol].awaiting_close says
+        when; no upstream request is made for it). Pass intraday=true to also get the current in-progress
+        snapshot (is_final=false), refreshed from upstream on a short TTL.
 
         Rows carry as_of/fetched_at/source/is_final/price_basis. adjust='qfq' returns a computed
         dividend-adjusted view (only for raw/split-adjusted series); default is the stored basis.
         refresh='always' requires the refresh scope. If a result shows rate_limited (tail_refresh_error or error.code) wait retry_after seconds and retry ONCE; never loop.
         """
         return await run(
-            service.price_history, symbols, _date(start_date), _date(end_date), refresh, adjust,
+            service.price_history, symbols, _date(start_date), _date(end_date), refresh, adjust, intraday,
             label="get_price_history",
         )
 
     @mcp.tool()
     async def get_latest_price(
-        symbol: str, refresh: RefreshPolicy = "missing", adjust: AdjustMode = "none"
+        symbol: str, refresh: RefreshPolicy = "missing", adjust: AdjustMode = "none", intraday: bool = False
     ) -> dict[str, Any]:
-        """Return the newest cached daily row; this is not a real-time quote. If a result shows rate_limited (tail_refresh_error or error.code) wait retry_after seconds and retry ONCE; never loop."""
-        return await run(service.latest_price, symbol, refresh, adjust, label="get_latest_price")
+        """Return the newest FINAL daily row; this is not a real-time quote. Before today's close the latest final
+        row is the previous trading day and awaiting_close tells when today's close becomes available
+        (intraday=true returns the in-progress row instead). If a result shows rate_limited (tail_refresh_error or error.code) wait retry_after seconds and retry ONCE; never loop."""
+        return await run(service.latest_price, symbol, refresh, adjust, intraday, label="get_latest_price")
 
     @mcp.tool()
     async def get_fund_nav_history(

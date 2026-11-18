@@ -204,21 +204,19 @@ class MarketStore:
             return [self._row_dict(d, None) for d in query.all()]
 
     @retry_transient
-    def query_latest(self, symbol: str) -> Optional[Dict[str, Any]]:
+    def query_latest(self, symbol: str, before: Optional[dt.date] = None) -> Optional[Dict[str, Any]]:
+        """最新一行；``before`` 给定时只看严格早于它的日期（「收盘前不看当日」用）。"""
         with self.ReadSession() as session:
             if self.meta_enabled:
-                pair = (
-                    self._joined_query(session, symbol)
-                    .order_by(TradingData.date.desc())
-                    .first()
-                )
+                query = self._joined_query(session, symbol)
+                if before is not None:
+                    query = query.filter(TradingData.date < before)
+                pair = query.order_by(TradingData.date.desc()).first()
                 return self._row_dict(*pair) if pair else None
-            data = (
-                session.query(TradingData)
-                .filter(TradingData.symbol == symbol)
-                .order_by(TradingData.date.desc())
-                .first()
-            )
+            query = session.query(TradingData).filter(TradingData.symbol == symbol)
+            if before is not None:
+                query = query.filter(TradingData.date < before)
+            data = query.order_by(TradingData.date.desc()).first()
             return self._row_dict(data, None) if data else None
 
     @retry_transient

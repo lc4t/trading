@@ -22,7 +22,38 @@ class NoDataError(RuntimeError):
     """缓存与上游都没有可返回的日线."""
 
 
-class RateLimitedError(NoDataError):
+class StructuredNoData(NoDataError):
+    """带结构化 body 的「没有数据」：客户端读 error.code 而不是解析文案."""
+
+    def body(self) -> Dict[str, Any]:  # pragma: no cover - 子类实现
+        raise NotImplementedError
+
+
+class AwaitingCloseError(StructuredNoData):
+    """只请求了尚未收盘的当日、又没有更早的已定稿行：告诉调用方什么时候来."""
+
+    def __init__(self, info: Dict[str, Any], symbols: List[str]) -> None:
+        self.info, self.symbols = info, symbols
+        super().__init__(
+            f"{info['date']} 的收盘价要等到 {info['final_ready_at']} 之后才能获取（还需 {info['wait_seconds']} 秒）；"
+            "需要盘中价请传 intraday=true"
+        )
+
+    def body(self) -> Dict[str, Any]:
+        return {
+            "error": {
+                "code": "awaiting_close",
+                "date": self.info["date"],
+                "final_ready_at": self.info["final_ready_at"],
+                "wait_seconds": self.info["wait_seconds"],
+                "symbols": self.symbols,
+                "message": str(self),
+            },
+            "wait_seconds": self.info["wait_seconds"],
+        }
+
+
+class RateLimitedError(StructuredNoData):
     """完全没有缓存、而上游正在限流冷却：返回结构化错误（带 retry_after），不是让客户端立刻重试的泛化异常."""
 
     def __init__(self, retry_after: int, symbols: List[str]) -> None:
@@ -106,13 +137,14 @@ class MarketService:
         end: date,
         refresh: str = "missing",
         adjust: str = "none",
+        intraday: bool = False,
     ) -> Dict[str, Any]:
         normalized = list(dict.fromkeys(normalize_symbol(s) for s in symbols))
         if not normalized:
             raise RequestError("At least one symbol is required")
         if len(normalized) > MAX_SYMBOLS_PER_REQUEST:
             raise RequestError(f"At most {MAX_SYMBOLS_PER_REQUEST} symbols per request")
-        return self._history(normalized, start, end, refresh, adjust)
+        return self._history(normalized, start, end, refresh, adjust, intraday)
 
     def fund_nav_history(
         self, fund_code: str, start: date, end: date, refresh: str = "missing"
@@ -124,9 +156,9 @@ class MarketService:
         return self.fund_nav_history(fund_code, start, end, "always")
 
     def _history(
-        self, symbols: List[str], start: date, end: date, refresh: str, adjust: str
+        self, symbols: List[str], start: date, end: date, refresh: str, adjust: str, intraday: bool = False
     ) -> Dict[str, Any]:
-        payloads = [self.cache.get_range(s, start, end, refresh, adjust) for s in symbols]
+        payloads = [self.cache.get_range(s, start, end, refresh, adjust, intraday) for s in symbols]
         cache_info: Dict[str, Dict[str, Any]] = {}
         views: List[Dict[str, Any]] = []
         for payload in payloads:
@@ -142,6 +174,7 @@ class MarketService:
                 "tail_refreshed": payload["tail_refreshed"],
                 "tail_refresh_error": payload["tail_refresh_error"],
                 "retry_after": payload["retry_after"],
+                "awaiting_close": payload["awaiting_close"],
                 "count": payload["count"],
                 "coverage_start": dates[0] if dates else None,
                 "coverage_end": dates[-1] if dates else None,
@@ -159,6 +192,9 @@ class MarketService:
         ]
         if not views and limited:
             raise RateLimitedError(max(r for _, r in limited), [sym for sym, _ in limited])
+        waiting = [(sym, c["awaiting_close"]) for sym, c in cache_info.items() if c["awaiting_close"]]
+        if not views and waiting:
+            raise AwaitingCloseError(max((w for _, w in waiting), key=lambda w: w["wait_seconds"]), [sym for sym, _ in waiting])
         if not views:
             hint = (
                 " (database is read-only: nothing cached and upstream refresh is disabled)"
@@ -184,17 +220,19 @@ class MarketService:
 
     # ------------------------------------------------------------------ latest
     def latest_price(
-        self, symbol: str, refresh: str = "missing", adjust: str = "none"
+        self, symbol: str, refresh: str = "missing", adjust: str = "none", intraday: bool = False
     ) -> Dict[str, Any]:
-        return self._latest(normalize_symbol(symbol), refresh, adjust)
+        return self._latest(normalize_symbol(symbol), refresh, adjust, intraday)
 
     def latest_fund_nav(self, fund_code: str, refresh: str = "missing") -> Dict[str, Any]:
         return self._latest(normalize_off_market_fund_symbol(fund_code), refresh, "none")
 
-    def _latest(self, symbol: str, refresh: str, adjust: str) -> Dict[str, Any]:
-        payload = self.cache.get_latest(symbol, refresh, adjust)
+    def _latest(self, symbol: str, refresh: str, adjust: str, intraday: bool = False) -> Dict[str, Any]:
+        payload = self.cache.get_latest(symbol, refresh, adjust, intraday)
         if payload["data"] is None and payload["tail_refresh_error"] == "rate_limited":
             raise RateLimitedError(payload["retry_after"], [symbol])
+        if payload["data"] is None and payload.get("awaiting_close"):
+            raise AwaitingCloseError(payload["awaiting_close"], [symbol])
         if payload["data"] is None:
             raise NoDataError(f"No daily market data for {symbol}")
         payload["data"] = serialize_row(payload["data"])

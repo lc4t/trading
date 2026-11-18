@@ -44,6 +44,7 @@ SYMBOLS = {  # 来源 -> (有缓存的标的, 没缓存的标的)
     "eastmoney_fund": ("005698", "110011"),
 }
 RESULTS: List[tuple] = []
+RESULTS_PRINTED = False
 HTTP = httpx.Client(trust_env=False)  # 本机回环请求不走代理
 
 
@@ -57,7 +58,7 @@ def check(name: str, observed: Any, expected: str, ok: bool) -> None:
 
 
 class Instance:
-    def __init__(self, label: str, port: int, mysql: Mysql, upstream_url: str, token: str, workdir: Path, **policy: Any):
+    def __init__(self, label: str, port: int, mysql: Mysql, upstream_url: str, token: str, workdir: Path, extra_env: Optional[Dict[str, str]] = None, **policy: Any):
         self.label, self.port, self.token = label, port, token
         self.url = f"http://127.0.0.1:{port}"
         self.log = workdir / f"{label}.log"
@@ -75,6 +76,7 @@ class Instance:
             "MCP_RATE_LIMIT_REFRESH_PER_MIN": "100000",
             "NO_PROXY": "127.0.0.1,localhost",
             "no_proxy": "127.0.0.1,localhost",
+            **(extra_env or {}),
         }
         self.proc: Optional[subprocess.Popen] = None
 
@@ -89,6 +91,11 @@ class Instance:
                 pass
             time.sleep(0.5)
         raise SystemExit(f"实例 {self.label} 启动失败，见 {self.log}")
+
+    def start_and_stop_to_create_tables(self, instances: List["Instance"]) -> None:
+        """只想建表：起一个实例再停掉（init_schema 在启动时执行）。"""
+        self.start()
+        self.stop()
 
     def stop(self) -> None:
         if self.proc and self.proc.poll() is None:
@@ -132,6 +139,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--client-src", help="AI 侧客户端所在的 src 目录（含 quant_engine 包）；给了才跑客户端步骤（只读运行，不写字节码）")
     ap.add_argument("--real-yahoo-probes", type=int, default=0, help="真实 Yahoo 探测次数（很小量，默认 0）")
+    ap.add_argument("--only-awaiting-close", action="store_true", help="只演练「收盘前不回源」一段（S11），约 1 分钟")
     ap.add_argument("--keep", action="store_true", help="结束后保留临时目录")
     args = ap.parse_args()
 
@@ -150,6 +158,11 @@ def main() -> int:
         def sql(q: str, **p: Any):
             with engine.begin() as conn:
                 return conn.execute(text(q), p).fetchall() if q.lstrip().lower().startswith("select") else conn.execute(text(q), p)
+
+        if args.only_awaiting_close:
+            Instance("A0", free_port(), mysql, up.url, token, work, base=3, cap=12, gap=0.2).start_and_stop_to_create_tables(instances)
+            phase_awaiting_close(mysql, up, token, work, instances, sql)
+            return finish(instances, up, mysql, work, args)
 
         # ---------------------------------------------------------------- 阶段一：短冷却（基准 3s，上限 12s）
         a = Instance("A1", free_port(), mysql, up.url, token, work, base=3, cap=12, gap=0.2)
@@ -321,24 +334,133 @@ def main() -> int:
         check("10 路并发 always 的上游请求数", d, "1", d == 1)
         check("10 路并发都拿到正常结果", sum(1 for o in outs if o["form"] == "正常结果" and (o.get("count") or 0) > 0), "10", all(o["form"] == "正常结果" for o in outs))
 
+        phase_awaiting_close(mysql, up, token, work, instances, sql)
+
         if args.real_yahoo_probes:
             say(f"\n[S10] 真实 Yahoo 探测 {args.real_yahoo_probes} 次（很小量；走与服务相同的 GuardedFetcher + 真实 yfinance）")
             probe_real_yahoo(args.real_yahoo_probes)
     finally:
-        for i in instances:
-            i.stop()
-        up.close()
-        mysql.stop()
-        if args.keep:
-            say(f"\n临时目录保留在 {work}（含各实例日志）")
-        else:
-            shutil.rmtree(work, ignore_errors=True)
+        if not RESULTS_PRINTED:
+            cleanup(instances, up, mysql, work, args)
+    return summarize()
 
+
+def cleanup(instances: List[Instance], up: FakeUpstream, mysql: Mysql, work: Path, args: argparse.Namespace) -> None:
+    for i in instances:
+        i.stop()
+    up.close()
+    mysql.stop()
+    if args.keep:
+        say(f"\n临时目录保留在 {work}（含各实例日志）")
+    else:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def finish(instances: List[Instance], up: FakeUpstream, mysql: Mysql, work: Path, args: argparse.Namespace) -> int:
+    cleanup(instances, up, mysql, work, args)
+    global RESULTS_PRINTED
+    RESULTS_PRINTED = True
+    return summarize()
+
+
+def summarize() -> int:
     failed = [r for r in RESULTS if not r[3]]
     say(f"\n== 汇总：{len(RESULTS) - len(failed)}/{len(RESULTS)} 项检查通过 ==")
     for name, observed, expected, _ in failed:
         say(f"  FAIL {name}: 观察={observed} 期望={expected}")
     return 1 if failed else 0
+
+
+def phase_awaiting_close(mysql: Mysql, up: FakeUpstream, token: str, work: Path, instances: List[Instance], sql: Any) -> None:
+    from zoneinfo import ZoneInfo
+
+    sh = ZoneInfo("Asia/Shanghai")
+    day = dt.datetime.now(sh).date()
+    while day.weekday() >= 5:  # 假时钟落在最近一个工作日
+        day -= dt.timedelta(days=1)
+    prev = day - dt.timedelta(days=1)
+    ready_text = f"{day.isoformat()}T15:30:00+08:00"
+    fake_now = dt.datetime.combine(day, dt.time(15, 29, 30), tzinfo=sh)  # 距「可定稿」30 秒
+    up.today = day
+    for s in up.mode:
+        up.mode[s] = "ok"
+        up.delay[s] = 0
+    say(f"\n[S11] 收盘前不回源：服务假时钟 = {fake_now.isoformat()}（A 股 15:00 收盘 + 30 分钟缓冲 → {ready_text} 可定稿，还差 30 秒）；假上游的「今天」= {day}")
+    a4 = Instance("A4", free_port(), mysql, up.url, token, work, extra_env={"MCP_TEST_NOW": fake_now.isoformat()}, base=3, cap=12, gap=0.2)
+    instances.append(a4)
+    a4.start()
+    cached, uncached_hist, only_today = "510300.SS", "513500.SS", "515000.SS"
+
+    def em_requests(before: int) -> List[str]:
+        return [path for _, source, path in up.log[before:] if source == "eastmoney"]
+
+    def call_hist(symbol: str, start: dt.date, end: dt.date, refresh: str = "missing", **extra: Any) -> Dict[str, Any]:
+        return a4.call("get_price_history", {"symbols": [symbol], "start_date": start.isoformat(), "end_date": end.isoformat(), "refresh": refresh, **extra})
+
+    before = len(up.log)
+    resp = call_hist(cached, day - dt.timedelta(days=30), prev)
+    sc = resp["sc"]
+    say(f"    a) 先备历史（范围到前一天 {prev}，不含当日）: count={sc['count']} 假上游请求数={len(em_requests(before))}")
+    check("备历史时回源 1 次", len(em_requests(before)), "1", len(em_requests(before)) == 1)
+
+    before = len(up.log)
+    resp = call_hist(cached, day - dt.timedelta(days=30), day)
+    entry = resp["sc"]["cache"][cached]
+    aw = entry["awaiting_close"]
+    last_row = resp["sc"]["data"][-1]["date"]
+    say(f"    b) 收盘前请求含当日（refresh=missing）: 假上游请求数={len(em_requests(before))}  count={resp['sc']['count']} 最后一行={last_row}")
+    say(f"       awaiting_close={aw}  tail_refresh_error={entry['tail_refresh_error']}  retry_after={entry['retry_after']}")
+    check("收盘前：假上游收到的请求数", len(em_requests(before)), "0", len(em_requests(before)) == 0)
+    check("awaiting_close.date / final_ready_at 正确", (aw["date"], aw["final_ready_at"]), f"({day}, {ready_text})", aw["date"] == day.isoformat() and aw["final_ready_at"] == ready_text)
+    check("awaiting_close.wait_seconds 在 1~30 之间（假时钟在走）", aw["wait_seconds"], "1..30", 1 <= aw["wait_seconds"] <= 30)
+    check("tail_refresh_error 保持 null（这不是错误）", (entry["tail_refresh_error"], entry["retry_after"]), "(None, None)", entry["tail_refresh_error"] is None and entry["retry_after"] is None)
+    check("返回的最后一行是前一个交易日的定稿行", last_row < day.isoformat() and resp["sc"]["data"][-1]["is_final"], f"< {day} 且 is_final", last_row < day.isoformat() and resp["sc"]["data"][-1]["is_final"])
+
+    before = len(up.log)
+    latest = a4.call("get_latest_price", {"symbol": cached})["sc"]
+    say(f"    c) get_latest_price: 假上游请求数={len(em_requests(before))}  data.date={latest['data']['date']}  awaiting_close={latest['awaiting_close']}")
+    say(f"       说明: {latest['awaiting_close_message']}")
+    check("get_latest 收盘前：不回源且带说明", (len(em_requests(before)), "15:30" in latest["awaiting_close_message"]), "(0, True)",
+          len(em_requests(before)) == 0 and "15:30" in latest["awaiting_close_message"] and latest["awaiting_close"]["date"] == day.isoformat())
+
+    before = len(up.log)
+    resp = call_hist(uncached_hist, day - dt.timedelta(days=30), day)
+    reqs = em_requests(before)
+    end_param = reqs[0].split("end=")[1].split("&")[0] if reqs else None
+    say(f"    d) 没缓存 + 范围含当日: 假上游请求数={len(reqs)}  请求的 end={end_param}（前一天={prev:%Y%m%d}）  count={resp['sc']['count']}  awaiting_close.date={resp['sc']['cache'][uncached_hist]['awaiting_close']['date']}")
+    check("没缓存时只回源到前一天，不碰当日", (len(reqs), end_param), f"(1, {prev:%Y%m%d})", len(reqs) == 1 and end_param == f"{prev:%Y%m%d}")
+
+    before = len(up.log)
+    resp = call_hist(only_today, day, day)
+    err = (resp["sc"].get("error") or {})
+    say(f"    e) 只请求当日且没缓存: isError={resp['isError']} error={err.get('code')} wait_seconds={err.get('wait_seconds')}  假上游请求数={len(em_requests(before))}")
+    check("只请求当日且没缓存：结构化 awaiting_close 错误，不回源", (resp["isError"], err.get("code"), len(em_requests(before))), "(True, awaiting_close, 0)",
+          resp["isError"] and err.get("code") == "awaiting_close" and len(em_requests(before)) == 0)
+
+    before = len(up.log)
+    resp = call_hist(cached, day - dt.timedelta(days=30), day, refresh="always", intraday=True)
+    row = resp["sc"]["data"][-1]
+    say(f"    f) intraday=true + refresh=always（显式要盘中值；always 绕过 TTL，便于观察）: 假上游请求数={len(em_requests(before))}  最后一行={row['date']} is_final={row['is_final']}  awaiting_close={resp['sc']['cache'][cached]['awaiting_close']}")
+    check("intraday=true：回源并带 is_final=false 的当日行", (len(em_requests(before)), row["date"], row["is_final"]), f"(1, {day}, False)",
+          len(em_requests(before)) == 1 and row["date"] == day.isoformat() and row["is_final"] is False)
+
+    left = call_hist(cached, day - dt.timedelta(days=30), day, refresh="never")["sc"]["cache"][cached]["awaiting_close"]["wait_seconds"]
+    wait = left + 2  # 多等 2 秒越过可定稿时刻
+    say(f"    …等待假时钟越过 {ready_text}（还差 {left}s，等 {wait}s）")
+    time.sleep(wait)
+    before = len(up.log)
+    resp = call_hist(cached, day - dt.timedelta(days=30), day)
+    row = resp["sc"]["data"][-1]
+    say(f"    g) 过了可定稿时刻: 假上游请求数={len(em_requests(before))}  最后一行={row['date']} is_final={row['is_final']} as_of={row['as_of']}  awaiting_close={resp['sc']['cache'][cached]['awaiting_close']}")
+    check("过了 final_ready_at 之后第一次请求就回源（不等 TTL），拿到定稿的当日行", (len(em_requests(before)), row["is_final"], resp["sc"]["cache"][cached]["awaiting_close"]), "(1, True, None)",
+          len(em_requests(before)) == 1 and row["is_final"] is True and resp["sc"]["cache"][cached]["awaiting_close"] is None)
+
+    before = len(up.log)
+    for refresh in ("missing", "missing", "never"):
+        call_hist(cached, day - dt.timedelta(days=30), day, refresh=refresh)
+        a4.call("get_latest_price", {"symbol": cached, "refresh": refresh})
+    say(f"    h) 当日行已定稿后再请求 6 次（missing / missing / never，含 get_latest）: 假上游请求数={len(em_requests(before))}")
+    check("已定稿的当日行永远不回源", len(em_requests(before)), "0", len(em_requests(before)) == 0)
 
 
 def probe_real_yahoo(n: int) -> None:

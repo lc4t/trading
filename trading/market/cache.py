@@ -23,8 +23,13 @@ from loguru import logger
 
 from .clock import (
     as_of_for,
+    awaiting_close,
     business_today,
+    to_iso,
+    wait_text,
+    weekday_on_or_before,
     final_ready_at,
+    market_today,
     is_final_snapshot,
     local_naive_to_utc,
     utcnow,
@@ -103,6 +108,7 @@ class MarketCache:
         self._intraday_ttl = intraday_ttl
         self._failure_backoff = failure_backoff
         self._tail_checked_at: Dict[str, float] = {}
+        self._tail_checked_wall: Dict[str, dt.datetime] = {}
         self._backoff: Dict[str, tuple[float, str]] = {}
         self._flights: Dict[str, _Flight] = {}
         self._flights_guard = threading.Lock()
@@ -159,9 +165,21 @@ class MarketCache:
                 earliest = v["date"]
         return earliest
 
-    def _tail_check_due(self, symbol: str) -> bool:
+    def _stamp_tail_check(self, symbol: str) -> None:
+        self._tail_checked_at[symbol] = self._monotonic()
+        self._tail_checked_wall[symbol] = self._now()
+
+    def _tail_check_due(self, symbol: str, finalizable_day: Optional[date] = None) -> bool:
+        """尾部检查是否到期：超过 TTL；或者上一次检查发生在 ``finalizable_day`` 可定稿之前、而现在已经可以定稿
+        （刚过收盘缓冲时，第一次请求就该去取当天的收盘价，不必再等 TTL）。"""
         checked = self._tail_checked_at.get(symbol)
-        return checked is None or self._monotonic() - checked >= self._tail_ttl
+        if checked is None or self._monotonic() - checked >= self._tail_ttl:
+            return True
+        if finalizable_day is not None:
+            wall = self._tail_checked_wall.get(symbol)
+            ready = final_ready_at(symbol, finalizable_day)
+            return wall is not None and wall < ready <= self._now()
+        return False
 
     # ------------------------------------------------------------------ fetch
     def _fetch_and_persist(self, symbol: str, start: date, end: date) -> tuple[Any, int]:
@@ -188,7 +206,7 @@ class MarketCache:
             raise ReadOnlyError("database is read-only")
         first_cached = self.store.first_date(symbol)
         result, _ = self._fetch_and_persist(symbol, start, end)
-        self._tail_checked_at[symbol] = self._monotonic()  # 刚回过源，尾部检查间隔从现在算起
+        self._stamp_tail_check(symbol)  # 刚回过源，尾部检查间隔从现在算起
         outcome = _Outcome(refreshed=True, source=result.source)
         verdict = corporate.assess(self.store, symbol, result, self._now())
         if verdict.trigger and first_cached is not None and first_cached < start:
@@ -229,10 +247,10 @@ class MarketCache:
         except Exception as exc:  # noqa: BLE001 - 上游任何失败都降级为返回缓存
             logger.warning(f"tail refresh failed for {symbol}: {type(exc).__name__}: {exc}")
             outcome = self._error_outcome(exc)
-            self._tail_checked_at[symbol] = self._monotonic()
+            self._stamp_tail_check(symbol)
             self._backoff[symbol] = (self._monotonic() + self._failure_backoff, outcome.error)
             return outcome
-        self._tail_checked_at[symbol] = self._monotonic()
+        self._stamp_tail_check(symbol)
         if outcome.error:
             self._backoff[symbol] = (self._monotonic() + self._failure_backoff, outcome.error)
         else:
@@ -281,6 +299,25 @@ class MarketCache:
             flight.done.set()
 
     # ------------------------------------------------------------------ reads
+    def _awaiting(self, symbol: str, end: date, intraday: bool) -> Optional[Dict[str, Any]]:
+        """请求范围包含该标的所在市场的「当日交易日」且还没到可定稿时刻 → 收盘前不回源，也不返回盘中行."""
+        if intraday:
+            return None
+        info = awaiting_close(symbol, self._now())
+        if info is None or end < info["date"]:
+            return None
+        return info
+
+    def _awaiting_view(self, info: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if info is None:
+            return None
+        wait = max(int(math.ceil((info["ready"] - self._now()).total_seconds())), 0)
+        return {
+            "date": info["date"].isoformat(),
+            "final_ready_at": to_iso(info["ready"]),
+            "wait_seconds": wait,
+        }
+
     @per_symbol
     def get_range(
         self,
@@ -289,6 +326,7 @@ class MarketCache:
         end: date,
         refresh: str = "missing",
         adjust: str = "none",
+        intraday: bool = False,
     ) -> Dict[str, Any]:
         symbol = normalize_symbol(symbol)
         self._validate_policy(refresh)
@@ -298,54 +336,80 @@ class MarketCache:
         if end > self.today():
             raise RequestError("end cannot be later than today")
 
+        awaiting = self._awaiting(symbol, end, intraday)
+        # 收盘前：当日这一行不可能是收盘价，所以回源窗口只到前一天；整个请求只有当日时根本不回源
+        fetch_end = awaiting["date"] - timedelta(days=1) if awaiting else end
+        can_fetch = fetch_end >= start
         outcome = _Outcome()
         raw_rows = self.store.query_range(symbol, start, end)
+        fetchable = [r for r in raw_rows if r["date"] <= fetch_end]
 
-        if refresh == "always" or (refresh == "missing" and not raw_rows):
-            outcome = self._refresh_coalesced(symbol, start, end, guarded=False)
-            raw_rows = self.store.query_range(symbol, start, end)
-        elif refresh == "missing":
-            views = [self.view(symbol, r) for r in raw_rows]
+        if refresh == "always" or (refresh == "missing" and not fetchable):
+            if can_fetch:
+                outcome = self._refresh_coalesced(symbol, start, fetch_end, guarded=False)
+                raw_rows = self.store.query_range(symbol, start, end)
+        elif refresh == "missing" and can_fetch:
+            views = [self.view(symbol, r) for r in fetchable]
             nonfinal_from = self._nonfinal_due(symbol, views, self._now())
             last = max(v["date"] for v in views)
-            tail_from = last if (last < end and self._tail_check_due(symbol)) else None
+            # 收盘前只要求缓存追到前一个工作日（周末没有交易，不需要追）
+            expected = weekday_on_or_before(fetch_end) if awaiting else end
+            finalizable = None if awaiting else weekday_on_or_before(min(end, market_today(symbol, self._now())))
+            tail_from = last if (last < expected and self._tail_check_due(symbol, finalizable)) else None
             candidates = [d for d in (nonfinal_from, tail_from) if d is not None]
             if candidates:
-                outcome = self._refresh_coalesced(symbol, min(candidates), end, guarded=True)
+                outcome = self._refresh_coalesced(symbol, min(candidates), fetch_end, guarded=True)
                 raw_rows = self.store.query_range(symbol, start, end)
 
         views = [self.view(symbol, r) for r in raw_rows]
+        if awaiting:  # 默认不返回当日的盘中快照，只给定稿的收盘价
+            views = [v for v in views if not (v["date"] >= awaiting["date"] and not v["is_final"])]
         self._report_backoff(symbol, outcome, refresh)
-        return self._payload(
-            symbol, views, outcome, refresh, adjust, start=start, end=end
-        )
+        payload = self._payload(symbol, views, outcome, refresh, adjust, start=start, end=end)
+        payload["awaiting_close"] = self._awaiting_view(awaiting)
+        return payload
 
+    @per_symbol
     def get_latest(
-        self, symbol: str, refresh: str = "missing", adjust: str = "none"
+        self, symbol: str, refresh: str = "missing", adjust: str = "none", intraday: bool = False
     ) -> Dict[str, Any]:
         symbol = normalize_symbol(symbol)
         self._validate_policy(refresh)
         self._validate_adjust(adjust)
         today = self.today()
+        awaiting = self._awaiting(symbol, today, intraday)
+        before = awaiting["date"] if awaiting else None
+        fetch_end = awaiting["date"] - timedelta(days=1) if awaiting else today
         outcome = _Outcome()
-        row = self.store.query_latest(symbol)
+        row = self.store.query_latest(symbol, before=before)
 
         if refresh == "always" or (refresh == "missing" and row is None):
-            outcome = self._refresh_coalesced(symbol, today - timedelta(days=45), today, guarded=False)
-            row = self.store.query_latest(symbol)
+            outcome = self._refresh_coalesced(symbol, fetch_end - timedelta(days=45), fetch_end, guarded=False)
+            row = self.store.query_latest(symbol, before=before)
         elif refresh == "missing":
             view = self.view(symbol, row)
             nonfinal_from = self._nonfinal_due(symbol, [view], self._now())
-            tail_from = view["date"] if (view["date"] < today and self._tail_check_due(symbol)) else None
+            expected = weekday_on_or_before(fetch_end) if awaiting else today
+            finalizable = None if awaiting else weekday_on_or_before(min(today, market_today(symbol, self._now())))
+            tail_from = view["date"] if (view["date"] < expected and self._tail_check_due(symbol, finalizable)) else None
             candidates = [d for d in (nonfinal_from, tail_from) if d is not None]
             if candidates:
-                outcome = self._refresh_coalesced(symbol, min(candidates), today, guarded=True)
-                row = self.store.query_latest(symbol)
+                outcome = self._refresh_coalesced(symbol, min(candidates), fetch_end, guarded=True)
+                row = self.store.query_latest(symbol, before=before)
 
         views = [self.view(symbol, row)] if row else []
         self._report_backoff(symbol, outcome, refresh)
         payload = self._payload(symbol, views, outcome, refresh, adjust)
         payload["data"] = payload["data"][0] if payload["data"] else None
+        info = self._awaiting_view(awaiting)
+        payload["awaiting_close"] = info
+        if info:
+            got = payload["data"]["date"] if payload["data"] else None
+            payload["awaiting_close_message"] = (
+                f"{info['date']} 的收盘价要等到 {info['final_ready_at']} 之后才能获取（还需{wait_text(info['wait_seconds'])}），"
+                + (f"当前返回的是 {got.isoformat()} 的收盘价。" if got else "目前没有更早的已定稿数据。")
+                + "需要盘中价请传 intraday=true。"
+            )
         return payload
 
     def _report_backoff(self, symbol: str, outcome: _Outcome, refresh: str) -> None:

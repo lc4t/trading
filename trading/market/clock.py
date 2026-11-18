@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 import datetime as dt
+import os
+import time
 from dataclasses import dataclass
 from zoneinfo import ZoneInfo
 
@@ -50,8 +52,23 @@ def session_for_symbol(symbol: str) -> MarketSession:
     return _US
 
 
+_TEST_CLOCK: tuple | None = None
+
+
 def utcnow() -> dt.datetime:
-    """当前时刻，naive UTC（与库内元数据时间戳同一约定）."""
+    """当前时刻，naive UTC（与库内元数据时间戳同一约定）.
+
+    仅演练 / 测试：同时设置 ``MCP_TEST_UPSTREAM_URL``（回环地址）和 ``MCP_TEST_NOW``（ISO 时刻，按 UTC 或带偏移）时，
+    时钟从该时刻起按真实流逝继续走，用来演练「收盘前 / 收盘后」。生产环境不要设置。
+    """
+    global _TEST_CLOCK
+    if os.environ.get("MCP_TEST_NOW") and os.environ.get("MCP_TEST_UPSTREAM_URL"):
+        if _TEST_CLOCK is None:
+            base = dt.datetime.fromisoformat(os.environ["MCP_TEST_NOW"])
+            if base.tzinfo is not None:
+                base = base.astimezone(UTC).replace(tzinfo=None)
+            _TEST_CLOCK = (base, time.monotonic())
+        return _TEST_CLOCK[0] + dt.timedelta(seconds=time.monotonic() - _TEST_CLOCK[1])
     return dt.datetime.now(UTC).replace(tzinfo=None)
 
 
@@ -101,3 +118,46 @@ def to_iso(value: dt.datetime | None) -> str | None:
     if value is None:
         return None
     return value.replace(tzinfo=UTC).astimezone(BUSINESS_TZ).isoformat(timespec="seconds")
+
+
+def market_today(symbol: str, now: dt.datetime) -> dt.date:
+    """标的所在市场的「当日」（交易所时区的自然日）；``now`` 为 naive UTC."""
+    session = session_for_symbol(symbol)
+    return now.replace(tzinfo=UTC).astimezone(session.tz).date()
+
+
+def prev_weekday(day: dt.date) -> dt.date:
+    """严格早于 ``day`` 的最近一个周一到周五（只看周末；没有节假日日历）。"""
+    day -= dt.timedelta(days=1)
+    while day.weekday() >= 5:
+        day -= dt.timedelta(days=1)
+    return day
+
+
+def weekday_on_or_before(day: dt.date) -> dt.date:
+    while day.weekday() >= 5:
+        day -= dt.timedelta(days=1)
+    return day
+
+
+def awaiting_close(symbol: str, now: dt.datetime) -> dict | None:
+    """若标的所在市场「当日」是工作日且还没到可定稿时刻，返回 ``{"date", "ready"}``，否则 None.
+
+    只按周末判断交易日——节假日没有交易日历，保持原行为（工作日的节假日会被当成「等收盘」，
+    此时本来也没有当日行，影响只是 ``awaiting_close`` 字段多说了一句）。
+    """
+    day = market_today(symbol, now)
+    if day.weekday() >= 5:
+        return None
+    ready = final_ready_at(symbol, day)
+    if now >= ready:
+        return None
+    return {"date": day, "ready": ready}
+
+
+def wait_text(seconds: int) -> str:
+    hours, rest = divmod(max(seconds, 0), 3600)
+    minutes = rest // 60
+    if hours:
+        return f"约 {hours} 小时 {minutes} 分钟"
+    return f"约 {max(minutes, 1)} 分钟"
