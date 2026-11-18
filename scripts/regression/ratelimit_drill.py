@@ -140,6 +140,7 @@ def main() -> int:
     ap.add_argument("--client-src", help="AI 侧客户端所在的 src 目录（含 quant_engine 包）；给了才跑客户端步骤（只读运行，不写字节码）")
     ap.add_argument("--real-yahoo-probes", type=int, default=0, help="真实 Yahoo 探测次数（很小量，默认 0）")
     ap.add_argument("--only-awaiting-close", action="store_true", help="只演练「收盘前不回源」一段（S11），约 1 分钟")
+    ap.add_argument("--only-fallback", action="store_true", help="只演练「Yahoo 不可达时的备用上游」一段（S12），约 1 分钟")
     ap.add_argument("--keep", action="store_true", help="结束后保留临时目录")
     args = ap.parse_args()
 
@@ -158,6 +159,11 @@ def main() -> int:
         def sql(q: str, **p: Any):
             with engine.begin() as conn:
                 return conn.execute(text(q), p).fetchall() if q.lstrip().lower().startswith("select") else conn.execute(text(q), p)
+
+        if args.only_fallback:
+            Instance("A0", free_port(), mysql, up.url, token, work, base=3, cap=12, gap=0.2).start_and_stop_to_create_tables(instances)
+            phase_fallback(mysql, up, token, work, instances, sql)
+            return finish(instances, up, mysql, work, args)
 
         if args.only_awaiting_close:
             Instance("A0", free_port(), mysql, up.url, token, work, base=3, cap=12, gap=0.2).start_and_stop_to_create_tables(instances)
@@ -198,16 +204,18 @@ def main() -> int:
         say("\n[S2] 冷却期内：反复刷新（always / missing，含同来源的其它标的），假上游收到的请求数必须为 0")
         for source, (cached, uncached) in SYMBOLS.items():
             before = up.snapshot()
-            seq: List[int] = []
+            seqs: Dict[str, List[int]] = {}
             for i in range(12):
                 sym = cached if i % 3 else (uncached or cached)
                 o = observe(a.history(sym, "always" if i % 2 else "missing"), sym)
                 if o.get("retry_after") is not None:
-                    seq.append(o["retry_after"])
+                    seqs.setdefault(sym, []).append(o["retry_after"])
             d = hits_delta(up, before)
             check(f"{source}: 12 次冷却期刷新的上游请求数", d.get(source, 0), "0", d.get(source, 0) == 0)
-            say(f"      retry_after 序列={seq}")
-            check(f"{source}: retry_after 随时间不增", seq == sorted(seq, reverse=True), "非递增", seq == sorted(seq, reverse=True))
+            # 逐标的看：港美股的没缓存标的会取「Yahoo 冷却 / 各备用源冷却」里最早恢复的那个，所以不同标的之间可以差 1 秒
+            for sym, seq in seqs.items():
+                say(f"      {sym} retry_after 序列={seq}")
+                check(f"{source}/{sym}: retry_after 随时间不增", seq == sorted(seq, reverse=True), "非递增", seq == sorted(seq, reverse=True))
 
         say("\n[S3] 没缓存时的返回形态（冷却期内，refresh=missing）")
         for source, (_, uncached) in SYMBOLS.items():
@@ -335,6 +343,7 @@ def main() -> int:
         check("10 路并发都拿到正常结果", sum(1 for o in outs if o["form"] == "正常结果" and (o.get("count") or 0) > 0), "10", all(o["form"] == "正常结果" for o in outs))
 
         phase_awaiting_close(mysql, up, token, work, instances, sql)
+        phase_fallback(mysql, up, token, work, instances, sql)
 
         if args.real_yahoo_probes:
             say(f"\n[S10] 真实 Yahoo 探测 {args.real_yahoo_probes} 次（很小量；走与服务相同的 GuardedFetcher + 真实 yfinance）")
@@ -461,6 +470,123 @@ def phase_awaiting_close(mysql: Mysql, up: FakeUpstream, token: str, work: Path,
         a4.call("get_latest_price", {"symbol": cached, "refresh": refresh})
     say(f"    h) 当日行已定稿后再请求 6 次（missing / missing / never，含 get_latest）: 假上游请求数={len(em_requests(before))}")
     check("已定稿的当日行永远不回源", len(em_requests(before)), "0", len(em_requests(before)) == 0)
+
+
+def phase_fallback(mysql: Mysql, up: FakeUpstream, token: str, work: Path, instances: List[Instance], sql: Any) -> None:
+    """S12：Yahoo 限流时港股 / 美股改用备用上游（东财不复权 / 新浪），走真实 HTTP + 真实 requests + 真实冷却保护."""
+    from fake_upstream import _price, _weekdays
+
+    for src in up.mode:
+        up.mode[src] = "ok"
+        up.delay[src] = 0
+    up.today = TODAY
+    end = TODAY - dt.timedelta(days=3)
+    while end.weekday() >= 5:
+        end -= dt.timedelta(days=1)
+    start = end - dt.timedelta(days=25)
+    window = _weekdays(start, end)
+    say(f"\n[S12] Yahoo 不可达时的备用上游：窗口 {start} ~ {end}（{len(window)} 个工作日，都早已收盘）；假上游的 Yahoo 对所有请求返回 429")
+    a5 = Instance("A5", free_port(), mysql, up.url, token, work, base=3, cap=12, gap=0.2)
+    instances.append(a5)
+    a5.start()
+    up.mode["yahoo"] = "limit"
+
+    def hist(symbol: str, refresh: str = "missing") -> Dict[str, Any]:
+        return a5.call("get_price_history", {"symbols": [symbol], "start_date": start.isoformat(), "end_date": end.isoformat(), "refresh": refresh})
+
+    def seed_legacy(symbol: str, code: str, factor: float) -> int:
+        rows = [d for d in window if d < end]  # 最后一个交易日留给备用源去补
+        for d in rows:
+            price = round(_price(code, d) * factor, 3)
+            sql("INSERT IGNORE INTO trading_data (symbol,date,open_price,close_price,high,low,volume,create_time,update_time) "
+                "VALUES (:s,:d,:p,:p,:p,:p,1,'2020-01-01 00:00:00',:u)", s=symbol, d=d, p=price, u=f"{(d + dt.timedelta(days=1)).isoformat()} 03:00:00")
+        return len(rows)
+
+    new_hk, new_us, legacy_ok, legacy_bad = "9988.HK", "NVDA", "0700.HK", "9626.HK"
+
+    before = up.snapshot()
+    resp = hist(new_hk)
+    info, sc = resp["sc"]["cache"][new_hk], resp["sc"]
+    d = hits_delta(up, before)
+    say(f"    a) 新港股 {new_hk}：fallback={info['fallback']} source={info['upstream_source']} price_basis={info['price_basis']} count={sc['count']} 假上游请求={d}")
+    check("a) Yahoo 429 → 东财不复权补齐（fallback=true、真实 source、unadjusted）",
+          (info["fallback"], info["upstream_source"], info["price_basis"], sc["count"] == len(window), d.get("yahoo"), d.get("eastmoney")),
+          "(True, eastmoney_fqt0, unadjusted, True, 1, 1)",
+          info["fallback"] is True and info["upstream_source"] == "eastmoney_fqt0" and info["price_basis"] == "unadjusted" and sc["count"] == len(window)
+          and d.get("yahoo") == 1 and d.get("eastmoney") == 1 and not d.get("sina") and not d.get("tencent"))
+    check("a) 行上标真实来源与口径", (sc["data"][-1]["source"], sc["data"][-1]["price_basis"], sc["data"][-1]["is_final"]), "(eastmoney_fqt0, unadjusted, True)",
+          sc["data"][-1]["source"] == "eastmoney_fqt0" and sc["data"][-1]["price_basis"] == "unadjusted" and sc["data"][-1]["is_final"] is True)
+
+    before = up.snapshot()
+    for _ in range(3):
+        hist(new_hk)
+    d = hits_delta(up, before)
+    say(f"    b) 已写入的定稿行再读 3 次：假上游请求={d}")
+    check("b) 定稿行不回源（备用源也一样）", sum(d.values()), "0", not d)
+
+    before = up.snapshot()
+    resp = hist(new_us)
+    info, sc = resp["sc"]["cache"][new_us], resp["sc"]
+    d = hits_delta(up, before)
+    say(f"    c) 新美股 {new_us}：source={info['upstream_source']} price_basis={info['price_basis']} count={sc['count']} 假上游请求={d}")
+    check("c) 美股首选新浪（不复权，只截窗口），不碰东财 / 腾讯", (info["upstream_source"], info["price_basis"], sc["count"] == len(window), d.get("sina"), d.get("eastmoney"), d.get("tencent")),
+          "(sina_us, unadjusted, True, 1, None, None)",
+          info["upstream_source"] == "sina_us" and info["price_basis"] == "unadjusted" and sc["count"] == len(window) and d.get("sina") == 1 and not d.get("eastmoney") and not d.get("tencent"))
+
+    n = seed_legacy(legacy_ok, "00700", 1.0)
+    before = up.snapshot()
+    resp = hist(legacy_ok)
+    info, sc = resp["sc"]["cache"][legacy_ok], resp["sc"]
+    d = hits_delta(up, before)
+    seeded_close = sql("SELECT close_price FROM trading_data WHERE symbol=:s AND date=:d", s=legacy_ok, d=window[n - 1])[0][0]
+    say(f"    d) 遗留序列 {legacy_ok}（{n} 行）重叠日一致：fallback={info['fallback']} price_bases={info['price_bases']} count={sc['count']} overlap={(info['fallback_detail'] or {}).get('overlap')}")
+    check("d) 重叠日校验通过：只追加锚点之后的行，口径标 mixed", (info["fallback"], info["tail_refresh_error"], info["price_basis"], sc["count"] == n + 1, sorted(info["price_bases"])),
+          "(True, None, mixed, True, [legacy_unknown, unadjusted])",
+          info["fallback"] is True and info["tail_refresh_error"] is None and info["price_basis"] == "mixed" and sc["count"] == n + 1
+          and sorted(info["price_bases"]) == ["legacy_unknown", "unadjusted"] and info["fallback_detail"]["overlap"]["ok"] is True)
+    check("d) 锚点行及更早的历史原样不动", float(seeded_close), f"{_price('00700', window[n - 1])}", abs(float(seeded_close) - _price("00700", window[n - 1])) < 1e-6)
+
+    m = seed_legacy(legacy_bad, "09626", 1.02)  # 库里的价格比不复权价高 2%：模拟已被 Yahoo 按分红调整
+    before = up.snapshot()
+    resp = hist(legacy_bad)
+    info, sc = resp["sc"]["cache"][legacy_bad], resp["sc"]
+    rows_after = sql("SELECT COUNT(*) FROM trading_data WHERE symbol=:s", s=legacy_bad)[0][0]
+    ov = (info["basis_mismatch"] or {}).get("overlap") or {}
+    say(f"    e) 遗留序列 {legacy_bad}（{m} 行）重叠日不一致：tail_refresh_error={info['tail_refresh_error']} fallback={info['fallback']} overlap={ov} 库内行数={rows_after}")
+    check("e) 重叠日校验失败：不追加，返回 basis_mismatch", (info["tail_refresh_error"], info["fallback"], ov.get("reason"), rows_after, d := hits_delta(up, before).get("tencent")),
+          f"(basis_mismatch, False, close_differs, {m}, None)",
+          info["tail_refresh_error"] == "basis_mismatch" and info["fallback"] is False and ov.get("reason") == "close_differs" and rows_after == m and not d)
+
+    for src in ("eastmoney", "sina", "tencent"):
+        up.mode[src] = "limit"
+    before = up.snapshot()
+    resp = hist("TSLA")
+    err = resp["sc"].get("error") or {}
+    attempts = (err.get("fallback_attempts") or {}).get("TSLA") or []
+    d = hits_delta(up, before)
+    say(f"    f) Yahoo 与全部备用源都限流（无缓存）：isError={resp['isError']} code={err.get('code')} retry_after={err.get('retry_after')} attempts={[(a['source'], a['result']) for a in attempts]} 假上游请求={d}")
+    check("f) 结构化 rate_limited，列出 3 个备用源各自的结果", (resp["isError"], err.get("code"), [a["source"] for a in attempts], {a["result"] for a in attempts}),
+          "(True, rate_limited, [sina_us, eastmoney_fqt0, tencent_qfq], {rate_limited})",
+          resp["isError"] and err.get("code") == "rate_limited" and [a["source"] for a in attempts] == ["sina_us", "eastmoney_fqt0", "tencent_qfq"]
+          and {a["result"] for a in attempts} == {"rate_limited"} and (err.get("retry_after") or 0) >= 1)
+    before = up.snapshot()
+    hist("TSLA")
+    hist("TSLA")
+    d = hits_delta(up, before)
+    check("f) 冷却 / 静默期内再请求：不再打任何上游", sum(d.values()), "0", not d)
+
+    for src in up.mode:
+        up.mode[src] = "ok"  # Yahoo 与备用源都恢复了
+    wait = (err.get("retry_after") or 3) + 3  # 等备用源自己的冷却结束（冷却状态在服务里，不会因为假上游恢复就消失）
+    say(f"    …等待备用源冷却结束（{wait}s）")
+    time.sleep(wait)
+    before = up.snapshot()
+    resp = hist(new_hk, "always")
+    info = resp["sc"]["cache"][new_hk]
+    d = hits_delta(up, before)
+    say(f"    g) Yahoo 恢复后，已锁在不复权口径的 {new_hk} 刷新：fallback_detail.reason={(info['fallback_detail'] or {}).get('reason')} 假上游请求={d}")
+    check("g) 序列已是不复权口径：沿用备用源、不去碰 Yahoo（Yahoo 的调整价接不上去）", (d.get("yahoo"), d.get("eastmoney"), (info["fallback_detail"] or {}).get("reason")),
+          "(None, 1, series_basis_locked)", not d.get("yahoo") and d.get("eastmoney") == 1 and (info["fallback_detail"] or {}).get("reason") == "series_basis_locked")
 
 
 def probe_real_yahoo(n: int) -> None:

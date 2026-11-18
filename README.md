@@ -191,6 +191,7 @@ result.plot()         # → matplotlib figure
 | `MCP_UPSTREAM_COOLDOWN_SECONDS` / `MCP_UPSTREAM_COOLDOWN_MAX_SECONDS` / `MCP_UPSTREAM_MIN_INTERVAL_SECONDS` | 否 | 上游限流冷却的基准 / 上限 / 请求最小间隔（秒），对所有来源统一覆盖；默认 Yahoo 120 / 1800 / 1，东财 60 / 900 / 0.3 |
 | `DB_POOL_PRE_PING` | 否 | 设为 `1` 开启连接池取连接前的 ping（默认关，省一个往返；断连由存储层幂等重试兜底） |
 | `MCP_READ_ONLY` | 否 | 设为 `1` 强制只读模式（见下）；账号没有写权限时也会自动进入 |
+| `MCP_UPSTREAM_FALLBACK` | 否 | 默认开启；设为 `0` 关闭「Yahoo 不可达时港股 / 美股改用备用上游」（见「港股 / 美股备用上游」） |
 | `MCP_ALLOWED_HOSTS` | 否 | 逗号分隔的 Host 白名单；设置后启用 DNS-rebinding 防护 |
 
 缺 `DB_*`、配置非法或数据库连不上时，服务**启动即失败**并打印原因（只写变量名，不回显值）。启动时自动建表（含元数据旁表）。
@@ -326,7 +327,7 @@ tool=get_price_history server_ms=2310.4 db_ops=3 db_statements=3 db_ms=96.2 upst
 
 上游限流（Yahoo 的 rate limit、HTTP 429、同花顺的 IP 限制）按**异常**处理，服务端负责不把上游越撞越死，调用方负责等待：
 
-- **按来源冷却（熔断）**：命中限流后该来源（`yahoo` / `eastmoney` / `eastmoney_fund` / `ths`）进入冷却，**冷却期内不发起任何上游请求**；
+- **按来源冷却（熔断）**：命中限流后该来源（`yahoo` / `eastmoney`（A 股与备用的港美股 K 线共用）/ `eastmoney_fund` / `ths` / `sina` / `tencent`）进入冷却，**冷却期内不发起任何上游请求**；
   冷却时长指数增长（连续触发越多越久）、带 ±20% 抖动、有上限，成功一次即清零；上游给了 `Retry-After` 就以它为下限。
 - **请求间隔与排队上限**：同一来源两次上游请求之间至少隔一段（Yahoo 1s）；排队等待超过 5s 就不再排，直接返回限流，请求路径上不会长时间 sleep。
 - **single-flight**：同一标的的并发刷新合并成一次，后到的请求共享结果；请求路径命中限流立即放弃、不重试，其它错误最多 2 次带抖动的短重试。
@@ -348,6 +349,60 @@ tool=get_price_history server_ms=2310.4 db_ops=3 db_statements=3 db_ms=96.2 upst
 
 **客户端应当**：看到 `retry_after` 就**等够这么多秒再来**（可加抖动），且重试次数有上限，不要在限流期间循环重试——冷却期内每次重试都不会触达上游，只会白白得到同样的答案。
 
+### 港股 / 美股备用上游（Yahoo 不可达时）
+
+部分机房 / VPS 的出口 IP 被 Yahoo 全面限流（yfinance、chart 直连、curl_cffi 指纹直连都 429）。港股 / 美股在 **Yahoo 返回限流或处于冷却期** 时改用备用上游；
+Yahoo 能用时仍然首选 Yahoo。指数（`^HSI`、`000300.SS`）、期货、加密货币没有备用源，行为不变。可用 `MCP_UPSTREAM_FALLBACK=0` 整体关闭。
+
+| 备用源（`source`） | 市场 | 写入的 `price_basis` | 说明 |
+| ---- | ---- | ---- | ---- |
+| `eastmoney_fqt0` | 港股（`116.<5 位代码>`）、美股（先 `105.` 纳斯达克，空再试 `106.` 纽交所） | `unadjusted` | **真·不复权**（拆股前的价格也是当时的价格）；量是股数不是手 |
+| `sina_us` | 仅美股 | `unadjusted` | 一次返回全部历史（不复权），服务只截请求窗口；港股没有端点 |
+| `tencent_qfq` | 港股、美股（后缀先 `.OQ` 再 `.N`） | `qfq_tencent` | **前复权**，只在不复权源都失败时作为最后备选；**绝不与不复权行混写** |
+
+顺序：港股 `eastmoney_fqt0 → tencent_qfq`；美股 `sina_us → eastmoney_fqt0 → tencent_qfq`。每个源都走同一套冷却 / 间隔保护（`eastmoney` 与 A 股 K 线共用冷却，`sina`、`tencent` 各自独立），
+同一标的的并发读取仍合并成一次回源（single-flight）；**每个 HTTP 请求最多 2 次**（含第一次），429 绝不重试，失败信息带来源、次数和最内层异常类名（如东财对美股的 `RemoteDisconnected`）。
+备用源只写**已经可以定稿**的行（不提供盘中价）：收盘前仍然不回源（`awaiting_close`），`intraday=true` 时 Yahoo 限流也拿不到当日盘中行。
+
+**序列级口径锁**：一个标的已存序列的口径（= 最后一个已定稿行的 `price_basis`）和候选行口径不同就**不追加**，不静默拼接：
+
+| 已存序列口径 | 追加 `unadjusted` | 追加 `qfq_tencent` |
+| ---- | ---- | ---- |
+| 空（新标的） | 直接写 | 直接写（仅当不复权源都失败） |
+| `unadjusted` | 直接写 | **拒绝**（不复权与前复权不混写） |
+| `qfq_tencent` | 拒绝 | 允许，但前复权每次除权都会改写历史，所以同样要通过重叠日校验 |
+| `yahoo_adjusted` / `legacy_unknown`（如 `0700.HK`、`9626.HK`） | **仅当重叠日校验通过** | 拒绝 |
+| `split_adjusted`（Yahoo 新写入的港美股序列）、`raw` 等 | 拒绝（拆股后不复权价与拆股调整价不同） | 拒绝 |
+
+备用源只**追加尾部**：口径不同的序列只写「最后一个已定稿行」**之后**的行，那一行和更早的历史原样不动，追加的行记自己的 `price_basis` / `source`（所以一条序列里会出现 `price_basis="mixed"`，返回里如实列出）。
+一条序列已经是 `unadjusted` / `qfq_tencent` 之后，后续回源**沿用备用源、不再去碰 Yahoo**（Yahoo 的调整价接不上去）；要回到 Yahoo 口径，对每晚流水线覆盖的标的（如 `0700.HK`）下一次 `tt-fetcher` 同步会按 Yahoo 口径重写窗口并自然恢复，
+不在流水线里的标的需要人工重建（`trading-mcp rebuild` 目前只处理遗留行，不处理这类序列）。
+
+**重叠日校验**（`trading.market.basis.overlap_check` / `check_overlap_rows`）：取备用源与库中**最后一个已定稿行的同一天**的收盘价，相对差必须 ≤ **0.01%**（`OVERLAP_TOLERANCE = 1e-4`；
+库里只存 4 位小数，所以再给半个存储精度的绝对容差，低价股的舍入不会误判）。备用源请求窗口会向前补到这一天；备用源没有这一天也视为不通过。通过说明库里那一行没有被除权除息改写过，不复权价与它同价位，追加不会在接缝处出现价格跳变。
+
+**返回里怎么看**（`cache[symbol]`；`get_latest_*` 在顶层）：
+
+| 字段 | 含义 |
+| ---- | ---- |
+| `fallback` / `fallback_detail` | 这一次刷新是否用了备用源；`fallback_detail = {reason: "yahoo_rate_limited" \| "series_basis_locked", source, price_basis, overlap, attempts}` |
+| 行上的 `source` / `price_basis` | 每一行都标真实来源和口径（`eastmoney_fqt0` / `sina_us` / `tencent_qfq`；`unadjusted` / `qfq_tencent`） |
+| `tail_refresh_error = "basis_mismatch"` + `basis_mismatch` | 备用源**抓到了数据但重叠日对不上**（或序列没有可校验的已定稿行）：没有追加任何行，`basis_mismatch.overlap` 给出两边的收盘价和相对差 |
+| `tail_refresh_error = "rate_limited"` + `fallback_attempts` | Yahoo 限流、备用源也没能追加：对外契约不变（`retry_after`），`fallback_attempts` 逐个列出每个备用源的结果（`fetch_failed` / `rate_limited` / `skipped_basis_mismatch` / `no_rows` …）。序列口径与备用口径只是「不同」（没去请求）时也走这一条，`basis_mismatch` 作附带说明——Yahoo 恢复后序列照常续上 |
+| 完全没有缓存且全部失败 | 结构化错误 `error.code="rate_limited"`，`error.fallback_attempts` 按标的列出每个备用源的结果 |
+
+**各源口径与已知限制**
+
+- **不复权 ≠ Yahoo 的调整价**。`unadjusted` 行在除息日会真实地跌一个分红额；`yahoo_adjusted` 序列里同一天不会。把二者接起来的那一天，日收益里会带一次分红的台阶——
+  重叠日校验只能证明**已经入库的行**没有被改写，**之后才发生的除权除息（含拆股）**在下一次 Yahoo 同步整段重写之前无法检测，接缝处会有一道等于分红额 / 拆股比例的台阶。
+  回测读到 `price_basis="mixed"` 时应当知道这一点（`data_quality` 里有）。
+- **拆股**：`unadjusted` 序列里拆股表现为真实的价格跳变（这是不复权的本意）；因此它**不会**接到 Yahoo 拆股调整过的序列（`split_adjusted`）上。
+  `adjust="qfq"` 对备用源的行明确拒绝（备用源不提供分红事件，无法在本服务里复权）。
+- **备用源不提供公司行动事件**：写备用源行时不建「公司行动基线」，Yahoo 恢复后第一次同步仍按原有「首次只建基线」的规则处理，不会把存量分红误判成新事件而整段重写。
+- **非官方接口**：东财 / 新浪 / 腾讯都没有鉴权和 SLA，字段与限流策略随时可能变。探测（见 [`scripts/probe`](scripts/probe/README.md)）里观察到：东财 `fqt=0` 对港股正常，对 `AAPL` 两次 `RemoteDisconnected`（所以美股首选新浪）；
+  新浪一次返回全部历史（体积大）；腾讯 `.OQ` / `.N` 后缀随交易所变，一次最多取最近约 1500 个自然日。
+- **没有的东西**：没有备用的盘中价；没有节假日日历；`volume` 单位在三个源之间不一定一致（东财 / 新浪是股数，腾讯未核实），不要跨序列比较成交量。
+
 ### 缓存语义
 
 - **已定稿的历史日线只读，不再回源**。缓存没覆盖的区间不会静默补抓，而是在 `coverage`（`gaps` 列表）里暴露；要补就显式 `refresh=always`。
@@ -358,7 +413,7 @@ tool=get_price_history server_ms=2310.4 db_ops=3 db_statements=3 db_ms=96.2 upst
   | 窗口 | `intraday=false`（默认） | 备注 |
   | ---- | ---- | ---- |
   | ① **收盘前**（当前时刻早于当日 `final_ready_at` = 收盘 + 30 分钟） | **不对当日这一行请求上游**，因此也不会触发限流冷却；返回已有的最新定稿行（不含当日盘中快照），`cache[symbol].awaiting_close = {"date", "final_ready_at"(北京时间 ISO8601), "wait_seconds"}`，`tail_refresh_error` 保持 `null`（这不是错误）。`get_latest_*` 在顶层带同样的 `awaiting_close`，外加一句可读说明（还要等多久才能拿到当日收盘价）。只请求当日且没有更早的行时返回结构化错误 `error.code="awaiting_close"`（带 `wait_seconds`） | 回源窗口只到**前一天**：没缓存的标的照常补历史，但绝不碰当日 |
-  | ② **收盘 + 缓冲之后、当晚流水线入库之前** | **需要回源**，且过了 `final_ready_at` 之后的**第一次请求就会回源**（不必等 10 分钟的尾部检查间隔），拿到的行直接是 `is_final=true` | A 股 / 场外基金走东财、同花顺；**港股、美股在目前的部署里走 Yahoo，出口 IP 被限流时会得到 `rate_limited` + `retry_after`——这是已知缺口，等备选上游落地**。流水线每晚在北京时间约 03:30 ~ 07:30 运行，所以港股在 16:40 到次日约 07:30 之间属于这一窗口；美股收盘约在北京时间 04:00 ~ 05:00（夏令 / 冬令），可能早于流水线，是否落在这一窗口取决于**当晚流水线是否覆盖该标的** |
+  | ② **收盘 + 缓冲之后、当晚流水线入库之前** | **需要回源**，且过了 `final_ready_at` 之后的**第一次请求就会回源**（不必等 10 分钟的尾部检查间隔），拿到的行直接是 `is_final=true` | A 股 / 场外基金走东财、同花顺；港股、美股首选 Yahoo，**Yahoo 被限流时改用备用上游**（东财不复权 / 新浪美股，见下一节），行带 `fallback=true` 与真实 `source`；备用源也失败才是 `rate_limited` + `retry_after`。流水线每晚在北京时间约 03:30 ~ 07:30 运行，所以港股在 16:40 到次日约 07:30 之间属于这一窗口；美股收盘约在北京时间 04:00 ~ 05:00（夏令 / 冬令），可能早于流水线，是否落在这一窗口取决于**当晚流水线是否覆盖该标的** |
   | ③ **入库之后**（该日已有 `is_final=true` 的行） | **读缓存，永不回源** | 流水线或前一次回源写入的定稿行不会再被刷新；`refresh=never` 同样 |
 
   `refresh=always` 是显式强制回源：收盘前同样只刷新到前一天，不会去拉当日的盘中行。
@@ -368,6 +423,7 @@ tool=get_price_history server_ms=2310.4 db_ops=3 db_statements=3 db_ms=96.2 upst
 - **价格口径 `price_basis`**：新标的写入不复权价（A 股场内 → 东财 `fqt=0`，`raw`；港股美股指数 → Yahoo `auto_adjust=False`，`split_adjusted`，仅拆分调整；场外基金 → 官方单位净值 `raw`）。
   分红/拆分事件另存 `market_corporate_actions`：检测到新的拆分时，受影响的历史行自动失效并重抓；`adjust="qfq"` 用已记录的分红即时计算前复权视图（不落库，返回里 `price_view=adjusted_qfq`）。
   **不再用分红额扣减历史价**。
+  Yahoo 不可达时港美股的备用上游写入 `unadjusted`（真·不复权）/ `qfq_tencent`（腾讯前复权），口径锁与重叠日校验见上一节。
 - **遗留数据**：2.0 之前 `trading_data` 里的行没有口径记录，返回里标 `price_basis=legacy_unknown`（其中 A 股 ETF 实际来自同花顺前复权全量、
   Yahoo 标的是 `auto_adjust` 价）。为避免同一序列混入两种口径，**已有历史行的标的继续沿用历史抓取方式**（`ths_qfq` / `yahoo_adjusted`），
   只有全新的标的才用不复权口径；一条序列里出现多种口径时 `price_basis="mixed"`，`price_bases` 列出全部。
@@ -387,6 +443,7 @@ uv run python scripts/regression/ratelimit_drill.py --real-yahoo-probes 3 # 另�
 
 假上游靠一个**仅用于测试**的环境变量接入：`MCP_TEST_UPSTREAM_URL=http://127.0.0.1:<端口>`（只接受回环地址，设置后启动日志会有醒目警告；生产环境不要设置）。
 演练里还有一段「收盘前不回源」（`--only-awaiting-close` 可单独跑，约 1 分钟）：用仅测试的 `MCP_TEST_NOW=<ISO 时刻>`（必须同时设置了 `MCP_TEST_UPSTREAM_URL`）把服务的时钟拨到收盘前 30 秒并让它继续走，观察收盘前假上游收到 0 个请求、`awaiting_close` 的字段值、过了 `final_ready_at` 之后才回源、定稿后永不回源。
+再有一段「Yahoo 不可达时的备用上游」（`--only-fallback` 可单独跑）：假上游的 Yahoo 全部 429，观察港股走东财不复权、美股走新浪、遗留序列的重叠日校验通过 / 失败、全部备用源也限流时的结构化错误、以及序列锁在不复权口径后 Yahoo 恢复也不再被请求。假上游里的新浪 / 腾讯端点是按探测到的响应格式手写的，只验证接线（请求、冷却、落库、返回字段），不代表真实源的稳定性。
 
 ## 遗留价格口径重建（`trading.cli.rebuild`）
 

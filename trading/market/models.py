@@ -9,8 +9,10 @@ from sqlalchemy import DATETIME, DECIMAL, Boolean, Column, Date, Integer, String
 
 from ..data.repository import Base
 
-PRICE_BASES = ("raw", "split_adjusted", "ths_qfq", "yahoo_adjusted", "legacy_unknown")
-# 不随分红改写历史价的口径（可以安全地只增量抓尾部）
+PRICE_BASES = ("raw", "split_adjusted", "ths_qfq", "yahoo_adjusted", "legacy_unknown", "unadjusted", "qfq_tencent")
+# 不随分红改写历史价的口径（可以安全地只增量抓尾部）。
+# unadjusted（备用源的真·不复权）不在其中：它与 Yahoo 的 split_adjusted 在拆股后不同，series_mode 把含它的序列视为「非纯 Yahoo 原始口径」，
+# 每晚同步按历史口径（Yahoo auto_adjust）重写窗口，从而把备用源补的尾部自然修复回 Yahoo 口径
 STABLE_BASES = frozenset({"raw", "split_adjusted"})
 
 

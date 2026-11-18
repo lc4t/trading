@@ -56,9 +56,10 @@ class AwaitingCloseError(StructuredNoData):
 class RateLimitedError(StructuredNoData):
     """完全没有缓存、而上游正在限流冷却：返回结构化错误（带 retry_after），不是让客户端立刻重试的泛化异常."""
 
-    def __init__(self, retry_after: int, symbols: List[str]) -> None:
+    def __init__(self, retry_after: int, symbols: List[str], attempts: Dict[str, Any] | None = None) -> None:
         self.retry_after = int(retry_after)
         self.symbols = symbols
+        self.attempts = attempts or {}  # symbol -> 备用源逐个的结果（Yahoo 限流且备用源也没拿到数据时）
         super().__init__(
             f"upstream is rate limited and nothing is cached for {', '.join(symbols)}; "
             f"retry after {self.retry_after}s"
@@ -71,6 +72,7 @@ class RateLimitedError(StructuredNoData):
                 "retry_after": self.retry_after,
                 "symbols": self.symbols,
                 "message": str(self),
+                **({"fallback_attempts": self.attempts} if self.attempts else {}),
             },
             "retry_after": self.retry_after,
         }
@@ -174,6 +176,10 @@ class MarketService:
                 "tail_refreshed": payload["tail_refreshed"],
                 "tail_refresh_error": payload["tail_refresh_error"],
                 "retry_after": payload["retry_after"],
+                "fallback": payload["fallback"],
+                "fallback_detail": payload["fallback_detail"],
+                "basis_mismatch": payload["basis_mismatch"],
+                "fallback_attempts": payload["fallback_attempts"],
                 "awaiting_close": payload["awaiting_close"],
                 "count": payload["count"],
                 "coverage_start": dates[0] if dates else None,
@@ -191,7 +197,11 @@ class MarketService:
             (sym, c["retry_after"]) for sym, c in cache_info.items() if c["tail_refresh_error"] == "rate_limited"
         ]
         if not views and limited:
-            raise RateLimitedError(max(r for _, r in limited), [sym for sym, _ in limited])
+            raise RateLimitedError(
+                max(r for _, r in limited),
+                [sym for sym, _ in limited],
+                {sym: cache_info[sym]["fallback_attempts"] for sym, _ in limited if cache_info[sym]["fallback_attempts"]},
+            )
         waiting = [(sym, c["awaiting_close"]) for sym, c in cache_info.items() if c["awaiting_close"]]
         if not views and waiting:
             raise AwaitingCloseError(max((w for _, w in waiting), key=lambda w: w["wait_seconds"]), [sym for sym, _ in waiting])
@@ -230,7 +240,11 @@ class MarketService:
     def _latest(self, symbol: str, refresh: str, adjust: str, intraday: bool = False) -> Dict[str, Any]:
         payload = self.cache.get_latest(symbol, refresh, adjust, intraday)
         if payload["data"] is None and payload["tail_refresh_error"] == "rate_limited":
-            raise RateLimitedError(payload["retry_after"], [symbol])
+            raise RateLimitedError(
+                payload["retry_after"],
+                [symbol],
+                {symbol: payload["fallback_attempts"]} if payload["fallback_attempts"] else None,
+            )
         if payload["data"] is None and payload.get("awaiting_close"):
             raise AwaitingCloseError(payload["awaiting_close"], [symbol])
         if payload["data"] is None:

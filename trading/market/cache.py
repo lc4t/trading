@@ -35,8 +35,30 @@ from .clock import (
     utcnow,
 )
 from . import corporate
-from .errors import FetchError, RateLimited, ReadOnlyError, RequestError
-from .fetchers import RangePriceFetcher, series_type_for_symbol, upstream_route_for_symbol
+from .basis import (
+    BACKUP_BASES,
+    MISMATCH,
+    OVERLAP,
+    append_rule,
+    check_overlap_rows,
+)
+from .errors import (
+    BackupExhausted,
+    BackupFailed,
+    BasisMismatch,
+    FetchError,
+    RateLimited,
+    ReadOnlyError,
+    RequestError,
+)
+from .fetchers import (
+    BACKUP_BASIS,
+    RangePriceFetcher,
+    backup_sources,
+    overseas_kind,
+    series_type_for_symbol,
+    upstream_route_for_symbol,
+)
 from .models import STABLE_BASES
 from .store import MarketStore
 from .timing import per_symbol, timed
@@ -51,6 +73,8 @@ DEFAULT_INTRADAY_TTL = 300.0  # 盘中非终值行的最长缓存时间
 RATE_LIMITED_ERROR = "rate_limited"  # tail_refresh_error 的固定取值：上游限流/冷却中，同时带 retry_after（秒）
 FLIGHT_WAIT_SECONDS = 90.0  # 等待同一标的正在进行的刷新的上限
 READ_ONLY_ERROR = "read_only"  # tail_refresh_error 的固定取值：数据库只读，没有回源
+BASIS_MISMATCH_ERROR = "basis_mismatch"  # tail_refresh_error 的固定取值：备用源口径与已存序列不同，没有追加
+BACKUP_NO_FINAL_WINDOW = 45  # 找「最后一个已定稿行」时往前看的天数
 DEFAULT_FAILURE_BACKOFF = 60.0  # 上游失败后的静默期
 GAP_TOLERANCE_DAYS = 10  # 超过它的日期缺口才算缺口（长假 + 周末约 9 天）
 
@@ -76,6 +100,9 @@ class _Outcome:
     source: Optional[str] = None
     corrected_rows: int = 0
     retry_after: Optional[int] = None
+    fallback: Optional[Dict[str, Any]] = None  # 这次刷新用了备用源：{reason, source, price_basis, attempts, overlap}
+    basis_mismatch: Optional[Dict[str, Any]] = None  # 备用源因口径不同 / 重叠日校验失败没有追加
+    attempts: Optional[List[Dict[str, Any]]] = None  # 备用源逐个的结果（失败时给调用方看）
 
 
 class _Flight:
@@ -99,6 +126,7 @@ class MarketCache:
         tail_check_ttl: float = DEFAULT_TAIL_CHECK_TTL,
         intraday_ttl: float = DEFAULT_INTRADAY_TTL,
         failure_backoff: float = DEFAULT_FAILURE_BACKOFF,
+        backup: bool = True,
     ) -> None:
         self.store = store
         self.fetcher = fetcher
@@ -109,7 +137,8 @@ class MarketCache:
         self._failure_backoff = failure_backoff
         self._tail_checked_at: Dict[str, float] = {}
         self._tail_checked_wall: Dict[str, dt.datetime] = {}
-        self._backoff: Dict[str, tuple[float, str]] = {}
+        self._backoff: Dict[str, tuple[float, _Outcome]] = {}
+        self._backup = backup
         self._flights: Dict[str, _Flight] = {}
         self._flights_guard = threading.Lock()
 
@@ -182,11 +211,49 @@ class MarketCache:
         return False
 
     # ------------------------------------------------------------------ fetch
+    def _backup_possible(self, symbol: str) -> bool:
+        if not self._backup or overseas_kind(symbol) is None:
+            return False
+        probe = getattr(self.fetcher, "has_backup", None)
+        return bool(probe()) if callable(probe) else hasattr(self.fetcher, "fetch_backup")
+
+    def _series_state(self, symbol: str) -> tuple[Optional[str], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        """已存序列的口径状态：(序列口径, 最后一个已定稿行, 最后一行). 序列口径 = 最后一个已定稿行的口径；
+        没有已定稿行就取最后一行；库里没有这个标的则为 None（空序列，任何口径都可以起头）."""
+        latest = self.store.query_latest(symbol)
+        if latest is None:
+            return None, None, None
+        tail = self.view(symbol, latest)
+        anchor: Optional[Dict[str, Any]] = tail if tail["is_final"] else None
+        if anchor is None:
+            recent = self.store.query_range(symbol, tail["date"] - timedelta(days=BACKUP_NO_FINAL_WINDOW), tail["date"])
+            finals = [v for v in (self.view(symbol, r) for r in recent) if v["is_final"]]
+            anchor = finals[-1] if finals else None
+        return (anchor or tail)["price_basis"], anchor, tail
+
     def _fetch_and_persist(self, symbol: str, start: date, end: date) -> tuple[Any, int]:
         mode = self.store.series_mode(symbol)
-        with timed("upstream"):
-            result = self.fetcher.fetch(symbol, start, end, mode=mode)
-        rows = [r for r in result.rows if start <= r["date"] <= end]
+        result = None
+        state = None
+        if mode == "legacy" and self._backup_possible(symbol):
+            state = self._series_state(symbol)
+            if state[0] in BACKUP_BASES:
+                # 序列已经是备用口径（不复权 / 腾讯前复权）：Yahoo 的行接不上去，继续用备用源，不去碰 Yahoo
+                result = self._fetch_backup(symbol, start, end, state, cause=None)
+        if result is None:
+            try:
+                with timed("upstream"):
+                    result = self.fetcher.fetch(symbol, start, end, mode=mode)
+            except RateLimited as exc:
+                # 港股 / 美股的主上游只有 Yahoo：它限流 / 冷却中才切换到备用源（备用源自己的限流在 _fetch_backup 里处理）
+                if not self._backup_possible(symbol):
+                    raise
+                state = state or self._series_state(symbol)
+                result = self._fetch_backup(symbol, start, end, state, cause=exc)
+        if result.fallback is not None:
+            rows = list(result.rows)  # 备用源已经按「只追加尾部」裁好了
+        else:
+            rows = [r for r in result.rows if start <= r["date"] <= end]
         fetched_at = self._now()
         finals = {r["date"]: is_final_snapshot(symbol, r["date"], fetched_at) for r in rows}
         as_of = {d: as_of_for(symbol, d, fetched_at, f) for d, f in finals.items()}
@@ -200,6 +267,112 @@ class MarketCache:
         )
         return result, written
 
+    def _fetch_backup(
+        self,
+        symbol: str,
+        start: date,
+        end: date,
+        state: tuple[Optional[str], Optional[Dict[str, Any]], Optional[Dict[str, Any]]],
+        cause: Optional[RateLimited],
+    ) -> Any:
+        """Yahoo 不可达时从备用源取数，并保证**不同口径不拼接**.
+
+        逐个备用源尝试（顺序见 ``backup_sources``）：口径锁（``append_rule``）→ 请求（受限流冷却/间隔保护，
+        每个 HTTP 请求最多 2 次）→ 需要时做重叠日校验 → 只保留「可定稿」且在已存序列尾部之后的行.
+        所有备用源都没给出可追加的数据时抛出带明确原因的异常（口径不符 / 备用源失败 / 备用源也限流）.
+        """
+        series_basis, anchor, tail = state
+        fetched_at = self._now()
+        attempts: List[Dict[str, Any]] = []
+        mismatch: Optional[Dict[str, Any]] = None
+        reason = "yahoo_rate_limited" if cause is not None else "series_basis_locked"
+        for source in backup_sources(symbol):
+            basis = BACKUP_BASIS[source]
+            rule = append_rule(series_basis, basis)
+            detail = {"series_basis": series_basis, "candidate_basis": basis, "source": source}
+            if rule == MISMATCH:
+                mismatch = mismatch or {**detail, "reason": "series_basis_differs"}
+                attempts.append({"source": source, "result": "skipped_basis_mismatch", "price_basis": basis})
+                continue
+            if rule == OVERLAP and anchor is None:
+                mismatch = mismatch or {**detail, "reason": "no_final_row_to_verify"}
+                attempts.append({"source": source, "result": "skipped_no_overlap_anchor", "price_basis": basis})
+                continue
+            win_start = min(start, anchor["date"]) if anchor is not None else start
+            try:
+                with timed("upstream"):
+                    res = self.fetcher.fetch_backup(symbol, win_start, end, source)
+            except RateLimited as exc:
+                attempts.append({"source": source, "result": "rate_limited", "retry_after": math.ceil(exc.retry_after)})
+                continue
+            except FetchError as exc:
+                attempts.append({"source": source, "result": "fetch_failed", "detail": str(exc)})
+                continue
+            rows = [r for r in res.rows if win_start <= r["date"] <= end]
+            if not rows:
+                attempts.append({"source": source, "result": "no_rows"})
+                continue
+            overlap = None
+            if rule == OVERLAP:
+                check = check_overlap_rows(anchor, rows)
+                overlap = check.as_dict()
+                if not check.ok:
+                    mismatch = {**detail, "reason": "overlap_check_failed", "overlap": overlap}
+                    attempts.append({"source": source, "result": "overlap_check_failed", "overlap": overlap})
+                    continue
+            rows = self._appendable(rows, anchor, tail, same_basis=(series_basis == basis))
+            # 只写已可定稿的行：备用源不提供盘中价（盘中值需要 intraday + 可用的 Yahoo）
+            rows = [r for r in rows if is_final_snapshot(symbol, r["date"], fetched_at)]
+            attempts.append({"source": source, "result": "ok", "rows": len(rows)})
+            res.rows = rows
+            res.fallback = {
+                "used": True,
+                "reason": reason,
+                "source": source,
+                "price_basis": basis,
+                "overlap": overlap,
+                "attempts": attempts,
+            }
+            logger.warning(f"{symbol} 使用备用上游 {source}（{reason}），写入 {len(rows)} 行，口径 {basis}")
+            return res
+
+        errors = [a for a in attempts if a["result"] in {"rate_limited", "fetch_failed"}]
+        refused_by_data = any(a["result"] == "overlap_check_failed" for a in attempts)
+        # 备用源抓到了数据、但重叠日对不上：这是数据层面的口径冲突，如实报 basis_mismatch。
+        # 仅仅是序列口径与备用口径不同（根本没去请求）：Yahoo 恢复后序列照常续上，所以对外仍是 rate_limited，
+        # basis_mismatch 只作为附带说明
+        if mismatch is not None and not errors and (refused_by_data or cause is None):
+            raise BasisMismatch(mismatch, attempts)
+        limited = [a["retry_after"] for a in attempts if a["result"] == "rate_limited"]
+        if cause is not None or limited:
+            hints = ([cause.retry_after] if cause is not None else []) + limited
+            if any(a["result"] == "fetch_failed" for a in attempts):
+                hints.append(self._failure_backoff)  # 有备用源只是临时失败：不必等到 Yahoo 冷却结束
+            raise BackupExhausted(
+                cause.source if cause is not None else "backup",
+                min(hints),
+                attempts,
+                basis_mismatch=mismatch,
+            ) from cause
+        raise BackupFailed(attempts)
+
+    @staticmethod
+    def _appendable(
+        rows: List[Dict[str, Any]],
+        anchor: Optional[Dict[str, Any]],
+        tail: Optional[Dict[str, Any]],
+        *,
+        same_basis: bool,
+    ) -> List[Dict[str, Any]]:
+        """备用源只追加尾部，不改写已有的历史行：口径不同的序列只写锚点日之后的行；
+        同口径可以连锚点日一起刷新；没有已定稿行时从最后一行（可能是盘中行）开始."""
+        if anchor is not None:
+            floor = anchor["date"]
+            return [r for r in rows if r["date"] > floor or (same_basis and r["date"] == floor)]
+        if tail is not None:
+            return [r for r in rows if r["date"] >= tail["date"]]
+        return rows
+
     def _refresh_window(self, symbol: str, start: date, end: date) -> _Outcome:
         """抓 [start, end] 并落库；检测到会改写历史的新公司行动时，把更早的历史也重写."""
         if self.store.read_only:
@@ -207,7 +380,10 @@ class MarketCache:
         first_cached = self.store.first_date(symbol)
         result, _ = self._fetch_and_persist(symbol, start, end)
         self._stamp_tail_check(symbol)  # 刚回过源，尾部检查间隔从现在算起
-        outcome = _Outcome(refreshed=True, source=result.source)
+        outcome = _Outcome(refreshed=True, source=result.source, fallback=result.fallback)
+        if result.fallback is not None:
+            # 备用源不提供分红 / 拆股事件：不建「首次检测」基线，否则 Yahoo 恢复后第一次同步会把存量事件误判成新事件而整段重写
+            return outcome
         verdict = corporate.assess(self.store, symbol, result, self._now())
         if verdict.trigger and first_cached is not None and first_cached < start:
             logger.warning(f"{symbol} 检测到新的公司行动 {[(a['kind'], a['ex_date']) for a in verdict.new]}，整段历史重写")
@@ -226,21 +402,41 @@ class MarketCache:
     @staticmethod
     def _error_outcome(exc: BaseException) -> _Outcome:
         """把刷新失败翻译成对外的 tail_refresh_error（限流 / 只读 / 其它）."""
+        if isinstance(exc, BackupExhausted):
+            return _Outcome(
+                error=RATE_LIMITED_ERROR,
+                retry_after=math.ceil(exc.retry_after),
+                attempts=exc.attempts,
+                basis_mismatch=exc.basis_mismatch,
+            )
         if isinstance(exc, RateLimited):
             return _Outcome(error=RATE_LIMITED_ERROR, retry_after=math.ceil(exc.retry_after))
         if isinstance(exc, ReadOnlyError):
             return _Outcome(error=READ_ONLY_ERROR)
+        if isinstance(exc, BasisMismatch):
+            return _Outcome(error=BASIS_MISMATCH_ERROR, basis_mismatch=exc.detail, attempts=exc.attempts)
+        if isinstance(exc, BackupFailed):
+            return _Outcome(error=f"BackupFailed: {exc}", attempts=exc.attempts)
         # 对外只给自己组装的 FetchError 文案；其它异常的消息可能带路径等内部细节，只暴露类型
         message = f"{type(exc).__name__}: {exc}" if isinstance(exc, FetchError) else type(exc).__name__
         return _Outcome(error=message)
 
     def _guarded_refresh(self, symbol: str, start: date, end: date) -> _Outcome:
         """尾部/非终值修复用：失败不抛出，只报告；失败后进入静默期（限流另由上游冷却保护）."""
-        backoff = self._backoff.get(symbol)
-        if backoff and self._monotonic() < backoff[0]:
-            return _Outcome(refreshed=False, error=backoff[1])
+        active = self._backoff_outcome(symbol)
+        if active is not None:
+            return active
         try:
             outcome = self._refresh_window(symbol, start, end)
+        except BackupExhausted as exc:
+            outcome = self._error_outcome(exc)
+            if any(a["result"] == "fetch_failed" for a in exc.attempts):
+                # 备用源只是临时失败（没有冷却保护）：按失败静默期处理，避免每次读取都把 2~3 个备用源再打一遍
+                self._stamp_tail_check(symbol)
+                self._set_backoff(symbol, outcome, min(outcome.retry_after or self._failure_backoff, self._failure_backoff))
+            # 其余情形（Yahoo 冷却 + 备用源口径不符 / 自己也在冷却）都由各来源的冷却保护兜底：
+            # 不记 tail 检查时间、不进静默期，冷却结束后第一次读取就会恢复，retry_after 随冷却递减
+            return outcome
         except (RateLimited, ReadOnlyError) as exc:
             # 冷却中：不记 tail 检查时间，也不进失败静默期——冷却结束后第一次读取就会恢复
             return self._error_outcome(exc)
@@ -248,20 +444,38 @@ class MarketCache:
             logger.warning(f"tail refresh failed for {symbol}: {type(exc).__name__}: {exc}")
             outcome = self._error_outcome(exc)
             self._stamp_tail_check(symbol)
-            self._backoff[symbol] = (self._monotonic() + self._failure_backoff, outcome.error)
+            self._set_backoff(symbol, outcome, self._failure_backoff)
             return outcome
         self._stamp_tail_check(symbol)
         if outcome.error:
-            self._backoff[symbol] = (self._monotonic() + self._failure_backoff, outcome.error)
+            self._set_backoff(symbol, outcome, self._failure_backoff)
         else:
             self._backoff.pop(symbol, None)
         return outcome
+
+    def _set_backoff(self, symbol: str, outcome: _Outcome, seconds: float) -> None:
+        self._backoff[symbol] = (self._monotonic() + seconds, outcome)
+
+    def _backoff_outcome(self, symbol: str) -> Optional[_Outcome]:
+        """静默期内：不回源，把上次失败的原因原样（含 retry_after 剩余秒数、口径不符详情）带出来."""
+        backoff = self._backoff.get(symbol)
+        if not backoff or self._monotonic() >= backoff[0]:
+            return None
+        until, last = backoff
+        remaining = max(math.ceil(until - self._monotonic()), 1)
+        return _Outcome(
+            refreshed=False,
+            error=last.error,
+            retry_after=remaining if last.retry_after is not None else None,
+            basis_mismatch=last.basis_mismatch,
+            attempts=last.attempts,
+        )
 
     def _plain_refresh(self, symbol: str, start: date, end: date) -> _Outcome:
         """显式刷新 / 缓存为空时的回源：限流与只读转成 outcome，其它失败照常抛出."""
         try:
             return self._refresh_window(symbol, start, end)
-        except (RateLimited, ReadOnlyError) as exc:
+        except (RateLimited, ReadOnlyError, BasisMismatch) as exc:
             return self._error_outcome(exc)
 
     def _refresh_coalesced(self, symbol: str, start: date, end: date, *, guarded: bool) -> _Outcome:
@@ -415,9 +629,12 @@ class MarketCache:
     def _report_backoff(self, symbol: str, outcome: _Outcome, refresh: str) -> None:
         """静默期内没有真正回源，但缓存数据可能因此偏旧——继续如实报告上次的失败原因."""
         if outcome.error is None and refresh == "missing":
-            backoff = self._backoff.get(symbol)
-            if backoff and self._monotonic() < backoff[0]:
-                outcome.error = backoff[1]
+            active = self._backoff_outcome(symbol)
+            if active is not None:
+                outcome.error = active.error
+                outcome.retry_after = active.retry_after
+                outcome.basis_mismatch = active.basis_mismatch
+                outcome.attempts = active.attempts
 
     # ---------------------------------------------------------------- payload
     def _payload(
@@ -435,6 +652,8 @@ class MarketCache:
             views = self._adjust(symbol, views)
         bases = sorted({v["price_basis"] for v in views})
         mode = "legacy" if any(b not in STABLE_BASES for b in bases) else "raw"
+        if views and views[-1]["price_basis"] in BACKUP_BASES:
+            mode = views[-1]["price_basis"]  # 最新一行来自备用源：路由说明如实反映
         sources = [v["source"] for v in views if v["source"]]
         payload: Dict[str, Any] = {
             "symbol": symbol,
@@ -446,6 +665,10 @@ class MarketCache:
             "tail_refreshed": outcome.refreshed and refresh == "missing",
             "tail_refresh_error": outcome.error,
             "retry_after": outcome.retry_after,
+            "fallback": outcome.fallback is not None,
+            "fallback_detail": outcome.fallback,
+            "basis_mismatch": outcome.basis_mismatch,
+            "fallback_attempts": outcome.attempts if outcome.error else None,
             "cache_status": (
                 "filled" if views else "empty_after_refresh" if outcome.refreshed else "empty"
             ),
@@ -465,6 +688,11 @@ class MarketCache:
 
     def _adjust(self, symbol: str, views: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         bad = {v["price_basis"] for v in views if v["price_basis"] not in STABLE_BASES}
+        if bad & BACKUP_BASES:
+            raise RequestError(
+                f"adjust=qfq 不可用：{symbol} 的行来自备用上游（{sorted(bad & BACKUP_BASES)}），备用源不提供分红事件，"
+                "无法在本服务里前复权，请使用 adjust=none"
+            )
         if bad:
             raise RequestError(
                 f"adjust=qfq 不可用：{symbol} 的价格口径 {sorted(bad)} 已经是调整价或口径未知，"

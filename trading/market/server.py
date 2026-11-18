@@ -125,7 +125,11 @@ def create_mcp(
             "fetched_at, source, is_final and price_basis: rows with is_final=false are intraday "
             "snapshots, not closing values. Off-market funds (six-digit codes) use official unit NAV. "
             "Upstream rate limiting is reported as rate_limited with retry_after seconds: wait that long and "
-            "retry once, never loop; cached rows are still returned meanwhile."
+            "retry once, never loop; cached rows are still returned meanwhile. For HK/US symbols, when Yahoo is "
+            "unreachable the service may fill the tail from a backup upstream: cache[symbol].fallback=true, the new "
+            "rows carry price_basis=unadjusted (raw prices, no dividend/split adjustment) and their real source; "
+            "tail_refresh_error=basis_mismatch means the backup rows were NOT appended because their price basis "
+            "differs from the stored series."
         ),
         host=config.host,
         port=config.port,
@@ -165,6 +169,9 @@ def create_mcp(
         Rows carry as_of/fetched_at/source/is_final/price_basis. adjust='qfq' returns a computed
         dividend-adjusted view (only for raw/split-adjusted series); default is the stored basis.
         refresh='always' requires the refresh scope. If a result shows rate_limited (tail_refresh_error or error.code) wait retry_after seconds and retry ONCE; never loop.
+        HK/US fallback: when Yahoo is rate limited the tail may come from a backup upstream (cache[symbol].fallback=true,
+        price_basis=unadjusted, source = the real source); a different price basis is never appended silently
+        (tail_refresh_error=basis_mismatch).
         """
         return await run(
             service.price_history, symbols, _date(start_date), _date(end_date), refresh, adjust, intraday,
