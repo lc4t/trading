@@ -124,7 +124,7 @@ def main() -> int:
         print("[ERROR] 所有已配置的通知渠道都发送失败", file=sys.stderr)
         return 1
 
-    print(f"[INFO] 推送成功渠道: {', '.join(result.sent)}")
+    print(f"[INFO] 已提交成功的渠道: {', '.join(result.sent)}")
     if result.failed:
         print(f"[WARN] 失败渠道: {', '.join(name for name, _ in result.failed)}", file=sys.stderr)
     return 0

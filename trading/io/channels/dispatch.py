@@ -25,12 +25,18 @@ class Channel:
     name: str
     required_env: tuple[str, ...]
     send: Callable[..., None]
+    ok_text: str = "发送成功"  # 日志措辞：iGotify 只能说「已提交到 Gotify」，不能说推送送达
 
 
 CHANNELS: tuple[Channel, ...] = (
     Channel("PushGo", pushgo.REQUIRED_ENV, pushgo.send),
     Channel("Resend", resend.REQUIRED_ENV, resend.send),
-    Channel("iGotify", igotify.REQUIRED_ENV, igotify.send),
+    Channel(
+        "iGotify",
+        igotify.REQUIRED_ENV,
+        igotify.send,
+        "已提交到 Gotify（推送横幅尽力而为，完整内容见 App 消息列表）",
+    ),
 )
 
 
@@ -88,7 +94,7 @@ def send_all(
             log("ERROR", f"渠道 {channel.name} 发送失败: {reason_text}", secrets)
         else:
             sent.append(channel.name)
-            log("INFO", f"渠道 {channel.name} 发送成功")
+            log("INFO", f"渠道 {channel.name} {channel.ok_text}")
     return DispatchResult(tuple(sent), tuple(failed), tuple(skipped))
 
 

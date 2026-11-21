@@ -3,6 +3,7 @@
 import copy
 import json
 import re
+import tempfile
 from datetime import date
 from pathlib import Path
 from urllib import error
@@ -11,7 +12,7 @@ import pytest
 from test_digest_markdown import assert_codes_named, buy_report, hold_report, rotation_report
 
 from trading.io import digest
-from trading.io.channels import Message, send_all
+from trading.io.channels import DispatchResult, Message, send_all
 from trading.io.channels.chunking import (
     Block,
     DigestParts,
@@ -21,7 +22,13 @@ from trading.io.channels.chunking import (
     parts_from_markdown,
     render_full,
 )
-from trading.io.channels.igotify import DEFAULT_MAX_BYTES, parse_max_bytes, plan_segments
+from trading.io.channels.igotify import (
+    DEFAULT_MAX_BYTES,
+    DEFAULT_SEGMENT_DELAY,
+    parse_max_bytes,
+    parse_segment_delay,
+    plan_segments,
+)
 from trading.io.channels.markup import markdown_to_html
 from trading.io.digest_markdown import build_digest_parts
 
@@ -306,7 +313,7 @@ def test_segments_sent_in_order_with_interval_and_markdown_extras():
     payloads = server.igotify()
     total = len(payloads)
     assert result.sent == ("iGotify",) and total > 1
-    assert sleeps == [1.0] * (total - 1)  # 段间隔 1 秒，最后一段后不等
+    assert sleeps == [8.0] * (total - 1)  # 默认段间隔 8 秒，最后一段后不等
     assert [p["title"].rsplit("(", 1)[1] for p in payloads] == [
         f"{i}/{total})" for i in range(1, total + 1)
     ]
@@ -324,8 +331,8 @@ def test_each_segment_retries_independently():
     result = send_all(long_message(), IGOTIFY_ENV, urlopen=server, sleep_fn=sleeps.append)
     assert result.sent == ("iGotify",)
     total = len(server.igotify())
-    assert total >= 4  # 11 项 → 至少 4 段（含 1 次重试的重复请求）
-    assert sleeps.count(1.0) >= total - 1  # 段间隔与重试退避都是 1 秒级
+    assert total >= 5  # 4 段 + 1 次重试
+    assert sleeps.count(8.0) == 3 and 1.0 in sleeps  # 4 段之间 3 个 8 秒间隔；重试退避仍是 1 秒级
 
 
 def test_partial_failure_names_the_segment_and_counts_as_channel_failure(capsys):
@@ -384,3 +391,86 @@ def test_email_is_not_segmented():
     payload = json.loads(server.requests[0].data)
     assert payload["text"] == message.markdown and payload["html"] == message.html
     assert byte_len(payload["text"]) > 3500
+
+
+def test_segment_delay_default_override_and_fallback(capsys):
+    assert DEFAULT_SEGMENT_DELAY == 8.0 == parse_segment_delay(None) == parse_segment_delay("  ")
+    assert (
+        parse_segment_delay("3") == 3.0
+        and parse_segment_delay("1") == 1.0
+        and parse_segment_delay("60") == 60.0
+    )
+    assert parse_segment_delay("12.5") == 12.5
+    assert capsys.readouterr().err == ""  # 合法值不告警
+    for bad in ("abc", "0", "0.5", "61", "-3", "nan", "inf"):
+        assert parse_segment_delay(bad) == 8.0, bad
+    assert capsys.readouterr().err.count("IGOTIFY_SEGMENT_DELAY 无效") == 7
+
+
+def test_env_segment_delay_controls_sleep_between_segments():
+    server, sleeps = Server(), []
+    send_all(
+        long_message(),
+        {**IGOTIFY_ENV, "IGOTIFY_SEGMENT_DELAY": "3"},
+        urlopen=server,
+        sleep_fn=sleeps.append,
+    )
+    total = len(server.igotify())
+    assert total > 1 and sleeps == [3.0] * (total - 1)
+    server2, sleeps2 = Server(), []
+    send_all(
+        long_message(),
+        {**IGOTIFY_ENV, "IGOTIFY_SEGMENT_DELAY": "999"},
+        urlopen=server2,
+        sleep_fn=sleeps2.append,
+    )
+    assert set(sleeps2) == {8.0}  # 非法值回退默认
+
+
+def test_logs_say_submitted_to_gotify_never_push_delivered(capsys):
+    server = Server()
+    result = send_all(long_message(), IGOTIFY_ENV, urlopen=server, sleep_fn=lambda _: None)
+    err = capsys.readouterr().err
+    total = len(server.igotify())
+    assert result.sent == ("iGotify",)
+    assert "渠道 iGotify 已提交到 Gotify" in err and "推送横幅尽力而为" in err
+    assert (
+        f"第 1/{total} 段已提交到 Gotify" in err and f"第 {total}/{total} 段已提交到 Gotify" in err
+    )
+    assert f"分 {total} 段顺序提交到 Gotify，段间隔 8 秒" in err
+    for wrong in ("推送成功", "送达", "发送成功"):
+        assert wrong not in err, wrong
+
+
+def test_failure_logs_also_say_submit_to_gotify(capsys):
+    server = Server([None, 400])
+    send_all(long_message(), IGOTIFY_ENV, urlopen=server, sleep_fn=lambda _: None)
+    lines = capsys.readouterr().err.splitlines()
+    segment_failure = next(ln for ln in lines if "第 2/" in ln and "失败" in ln)
+    assert (
+        segment_failure.startswith("[ERROR] iGotify 第 2/")
+        and "段提交到 Gotify 失败" in segment_failure
+    )
+    assert any("部分失败：第 2 段失败" in ln for ln in lines)
+
+
+def test_cli_prints_submitted_wording(capsys):
+    from unittest import mock
+
+    from trading.cli import digest as digest_cli
+
+    def fake_send_all(message, env, **options):
+        return DispatchResult(("iGotify",), (), ())
+
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "a.json").write_text(json.dumps(hold_report()), encoding="utf-8")
+        argv = ["trading.cli.digest", "--data-dir", tmp, "--date", "2026-03-10"]
+        with (
+            mock.patch("sys.argv", argv),
+            mock.patch.dict("os.environ", {}, clear=True),
+            mock.patch("trading.cli.digest.load_dotenv"),
+            mock.patch("trading.cli.digest.send_all", fake_send_all),
+        ):
+            assert digest_cli.main() == 0
+    out = capsys.readouterr().out
+    assert "已提交成功的渠道: iGotify" in out and "推送成功" not in out
