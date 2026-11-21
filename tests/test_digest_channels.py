@@ -289,6 +289,37 @@ def test_build_email_subject_includes_date_and_names():
     assert "2026-03-10" in subject and "买入标的" in subject and "空仓标的" not in subject
 
 
+EMPTY_NEW_CHANNELS = {
+    "RESEND_API_KEY": "",
+    "RESEND_FROM": "",
+    "RESEND_TO": "",
+    "IGOTIFY_URL": "",
+    "IGOTIFY_TOKEN": "  ",  # 纯空白也按未配置处理
+}
+PUSHGO_ENV = {k: v for k, v in FULL_ENV.items() if k.startswith("PUSHGO")}
+
+
+def test_empty_string_secrets_are_skipped_and_pushgo_unaffected():
+    """GitHub Secrets 未配置时 workflow 会传入空串：新渠道必须安静跳过，PushGo 行为不变。"""
+    result, rec, _ = run({**PUSHGO_ENV, **EMPTY_NEW_CHANNELS}, {PUSHGO: [OK_PUSHGO]})
+    assert result.sent == ("PushGo",) and result.skipped == ("Resend", "iGotify")
+    assert result.failed == () and len(rec.requests) == 1
+
+
+class TestEmptySecretsExitCodes:
+    def _run(self, env, plan):
+        return TestMainExitCodes()._run({**env, **EMPTY_NEW_CHANNELS}, plan)
+
+    def test_pushgo_ok_exit_0(self):
+        assert self._run(PUSHGO_ENV, {PUSHGO: [OK_PUSHGO]}) == 0
+
+    def test_pushgo_fails_exit_1_same_as_before(self):
+        assert self._run(PUSHGO_ENV, {PUSHGO: [http_error(500)]}) == 1
+
+    def test_everything_unconfigured_exit_1_same_as_before(self):
+        assert self._run({}, {}) == 1
+
+
 class TestMainExitCodes:
     def _run(self, env, plan):
         with tempfile.TemporaryDirectory() as tmp:
