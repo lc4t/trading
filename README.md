@@ -93,7 +93,7 @@ PUSHGO_URL=https://gateway.pushgo.dev/push
 | 渠道 | 必填变量 | 可选变量 | 说明 |
 | --- | --- | --- | --- |
 | Resend（邮件） | `RESEND_API_KEY`、`RESEND_FROM`、`RESEND_TO` | — | `RESEND_TO` 多个收件人用逗号分隔；`RESEND_FROM` 必须是已在 Resend 验证过的域名/地址；调用 `POST https://api.resend.com/emails`，同时带 `html`（由同一份 Markdown 转换，内联样式、适配深色模式与手机宽度、数据全部转义）与 `text`（Markdown 原文）两个版本，主题含日期与有信号的标的名 |
-| iGotify（Gotify 协议） | `IGOTIFY_URL`、`IGOTIFY_TOKEN` | `IGOTIFY_PRIORITY`（默认 5）、`IGOTIFY_MAX_BYTES`（单条字节上限防护，默认 3000）、`IGOTIFY_SEGMENT_DELAY`（分段间隔秒数，默认 8，范围 1~60）、`IGOTIFY_ALLOW_HTTP=1`（仅本地测试允许 http） | 调用 `POST {IGOTIFY_URL}/message`，令牌走请求头 `X-Gotify-Key`；`IGOTIFY_URL` 末尾斜杠会被规范化，默认只接受 https；正文是手机精简版 Markdown（`extras: {"client::display": {"contentType": "text/markdown"}}`），标题带序号与结论摘要，优先级沿用 `IGOTIFY_PRIORITY`。**200 只代表已提交到 Gotify，不代表苹果推送成功**（见下） |
+| iGotify（Gotify 协议） | `IGOTIFY_URL`、`IGOTIFY_TOKEN` | `IGOTIFY_PRIORITY`（默认 5）、`IGOTIFY_MAX_BYTES`（整条消息字节上限，超过才分段，默认 3000）、`IGOTIFY_SEGMENT_DELAY`（分段间隔秒数，默认 8，范围 1~60）、`IGOTIFY_ALLOW_HTTP=1`（仅本地测试允许 http） | 调用 `POST {IGOTIFY_URL}/message`，令牌走请求头 `X-Gotify-Key`；`IGOTIFY_URL` 末尾斜杠会被规范化，默认只接受 https；正文是手机精简版 Markdown（`extras: {"client::display": {"contentType": "text/markdown"}}`），标题「trading 日报 日期 结论摘要」（仅超限分段时才带 `(n/m)` 序号），优先级沿用 `IGOTIFY_PRIORITY`。**200 只代表已提交到 Gotify，不代表苹果推送成功**（见下） |
 
 ```bash
 uv run python -m trading.cli.digest --data-dir frontend/data
@@ -114,10 +114,10 @@ uv run python -m trading.cli.digest --data-dir frontend/data
 - 所有已配置渠道都会尝试发送，彼此独立：任一渠道失败只记录渠道名与脱敏后的原因，不影响其它渠道
 - PushGo 沿用 `--max-retries` / `--retry-delay`；Resend 与 iGotify 固定 10 秒超时、最多重试 2 次（1s、2s 指数退避），只对网络错误、5xx、429 重试，其它 4xx 不重试
 - 至少一个渠道成功提交则命令返回 0；没有任何已配置渠道，或所有已配置渠道都失败时，命令非零退出。注意措辞：iGotify 的「成功」只代表**已提交到 Gotify**，日志里也这样写
-- **iGotify 的送达语义**：Gotify 服务端返回 200 只表示消息已存入 Gotify，**不代表苹果推送成功**。iGotify 的推送横幅是尽力而为：助手把消息加密转发到 APNs，实测会不定时失败（与消息长短无关——1435 字节失败、3340 字节成功），失败后助手 WebSocket 会断开约 2 秒，之后一小段时间内到达的消息可能收不到横幅，所以分段之间默认间隔 8 秒（`IGOTIFY_SEGMENT_DELAY` 可调）。字节上限（`IGOTIFY_MAX_BYTES`）只是防护，不保证不超就不失败。完整日报在 iGotify App 的消息列表里一定看得到；**要可靠送达完整版，请用邮件（Resend）**
+- **iGotify 的送达语义**：Gotify 服务端返回 200 只表示消息已存入 Gotify，**不代表苹果推送成功**。iGotify 的推送横幅是尽力而为：助手把消息加密转发到 APNs，实测会不定时失败（与消息长短无关——1435 字节失败、3340 字节成功），失败后助手 WebSocket 会断开约 2 秒，之后一小段时间内到达的消息可能收不到横幅，所以回退到分段发送时段间默认间隔 8 秒（`IGOTIFY_SEGMENT_DELAY` 可调）。字节上限（`IGOTIFY_MAX_BYTES`）只决定「一条还是分段」，不保证不超就不失败。完整日报在 iGotify App 的消息列表里一定看得到；**要可靠送达完整版，请用邮件（Resend）**
 - 日志不会出现令牌、完整 URL 查询串或邮箱地址
 - **三个版本各取所需**：PushGo 保持原有精简正文不变；**邮件**用完整版 Markdown（`trading/io/digest_markdown.py`：今日结论、状态总览、标的详情、回测与绩效、数据提示、边界声明，不截断）；**iGotify** 用手机精简版（`trading/io/digest_push.py`），只回答「今天要做什么、每个标的现在什么状态、哪里需要盯」，回测概览、绩效、年度收益、策略参数、交易/换仓明细、动量全排名一律不进推送
-- iGotify 固定分条：①今日结论（第一行直接给结论，如「🔄 今日需操作 3 项」或「✅ 今日无信号变化」，只列有动作的标的，每个一行，整条尽量 ≤600 字节让横幅能弹出）②状态总览（每个标的一组：「emoji **名称（代码）** 动作」+ 1~2 行短字段：持仓｜浮盈、止损（含距现价）｜切换日）③需关注（只为有动作或数据异常的标的写，每个最多 3 行：依据 ≤30 字 / 触发 / 止损，轮动只写目标；当天没有则整条省略）；边界声明压成 1 行放在最后一条末尾。常规日 2~3 条
+- iGotify **常规日一份日报 = 一条消息**：标题「trading 日报 日期 结论摘要」（如 `trading 日报 2026-11-22 买入 1`），正文按顺序拼接 ①今日结论（第一行直接给结论，如「🔄 今日需操作 3 项」或「✅ 今日无信号变化」，只列有动作的标的，每个一行）②状态总览（每个标的一组：「emoji **名称（代码）** 动作」+ 1~2 行短字段：持仓｜浮盈、止损（含距现价）｜切换日）③需关注（只为有动作或数据异常的标的写，每个最多 3 行：依据 ≤30 字 / 触发 / 止损，轮动只写目标；当天没有则整节省略），小节之间空行 + 二级标题；边界声明压成 1 行放在末尾。**只有整条消息（标题 + 正文，UTF-8 字节）超过 `IGOTIFY_MAX_BYTES`（默认 3000）才自动回退到分段发送**（标题带 `(n/m)` 序号，第 1 条是结论，其余按小节/标的整块装箱，段间隔默认 8 秒）。日志会明确写「iGotify 日报 1 条已提交到 Gotify」或「分 N 段」
 - 版式：只用一级小标题（##）+ 列表，**不使用表格**（手机太窄）；动作词与标的名加粗、其余不加粗；字段行按显示宽度（约 22 个全角字符）手动拆行；邮件沿用同一套列表结构（表格在手机邮件客户端里同样容易被挤）。HTML 在 iGotify 里不渲染，只用于邮件。凡出现标的/基金代码的地方一律写成「名称（代码）」（名称取数据里的 name，缺失用已知映射，再缺失写「未知名称（代码）」并在日志里告警）。来自数据的文本都会转义，避免被渲染成链接或图片
 - 单标的 JSON 的 `latestSignal` 新增 `stopLoss`（类型/止损价/距现价%）与 `conditions`（触发条件）两个可选字段，供完整版日报使用；旧前端忽略未知字段
 

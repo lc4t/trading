@@ -1,8 +1,11 @@
 """iGotify 渠道（服务端是 Gotify 协议）：POST {IGOTIFY_URL}/message。
 
 环境变量：IGOTIFY_URL、IGOTIFY_TOKEN（应用令牌）、可选 IGOTIFY_PRIORITY（默认 5）、
-IGOTIFY_MAX_BYTES（单条字节上限，默认 3000）、IGOTIFY_SEGMENT_DELAY（分段间隔秒数，默认 8，范围 1~60）、
+IGOTIFY_MAX_BYTES（整条消息字节上限，默认 3000）、IGOTIFY_SEGMENT_DELAY（分段间隔秒数，默认 8，范围 1~60）、
 IGOTIFY_ALLOW_HTTP=1（仅本地测试允许 http）。令牌放请求头 X-Gotify-Key，不进 URL。
+
+发送方式：常规日一份日报 = 一条消息（标题「trading 日报 日期 结论摘要」，正文 今日结论 → 状态总览 → 需关注）；
+只有整条消息（标题 + 正文，UTF-8 字节）超过 IGOTIFY_MAX_BYTES 才自动回退到分段发送。
 
 送达语义（务必如实理解）：Gotify 服务端返回 200 只代表消息「已提交到 Gotify」并存进消息列表，
 **不代表**苹果推送成功。iGotify 的推送横幅是尽力而为：助手把消息加密转发到 APNs，实测会不定时失败
@@ -16,14 +19,15 @@ import time
 from typing import Mapping
 from urllib.parse import urlsplit
 
-from .chunking import MIN_BUDGET, DigestParts, byte_len, pack, parts_from_markdown
+from .chunking import MIN_BUDGET, DigestParts, byte_len, pack, parts_from_markdown, render_full
 from .common import ChannelError, Message, log, post_json
 
 REQUIRED_ENV = ("IGOTIFY_URL", "IGOTIFY_TOKEN")
 DEFAULT_PRIORITY = 5
 # Gotify 官方：client::display.contentType = text/markdown 时客户端按 Markdown 渲染、忽略 HTML。
 MARKDOWN_EXTRAS = {"client::display": {"contentType": "text/markdown"}}
-# 单条消息的字节上限防护（含标题），超长日报按字节分段顺序发送，IGOTIFY_MAX_BYTES 可覆盖。
+# 常规日一份日报 = 一条消息；只有整条消息（标题 + 正文，UTF-8 字节）超过这个上限才回退到分段发送，
+# IGOTIFY_MAX_BYTES 可覆盖。
 # 注意：这只是一道防护，并不保证「不超过它就不会失败」——实测横幅失败与长度无关（1435 字节失败、
 # 3340 字节成功），更像助手的不稳定故障，所以不要把「缩短」当成防失败手段。
 DEFAULT_MAX_BYTES = 3000
@@ -97,13 +101,23 @@ def segment_titles(parts: DigestParts, count: int) -> list[str]:
 
 
 def plan_segments(message: Message, max_bytes: int) -> list[tuple[str, str]]:
-    """返回 [(标题, 正文)]；只有 1 条时沿用日报原标题，多条时标题带序号（第 1 条带结论摘要）。"""
+    """返回 [(标题, 正文)]。
+
+    默认一份日报一条消息：标题「trading 日报 日期 结论摘要」，正文按「今日结论 → 状态总览 → 需关注」拼接；
+    只有整条消息（标题 + 正文，UTF-8 字节）超过 max_bytes 才回退到分段发送（标题带 (n/m) 序号）。
+    """
     parts = message.parts or parts_from_markdown(message.markdown or message.body, message.title)
+    if message.parts:
+        title = f"{parts.label} {parts.headline}".strip()
+        body = render_full(parts).rstrip("\n")
+    else:  # 没有结构信息（通用 Markdown）：沿用日报原标题与原文
+        title, body = message.title, message.markdown or message.body
+    if byte_len(title) + byte_len(body) <= max_bytes:
+        return [(title, body)]
     worst_title = f"{parts.label} {parts.headline} (99/99)".strip()
     bodies = pack(parts, max_bytes - byte_len(worst_title))
-    if len(bodies) <= 1:
-        body = bodies[0] if (bodies and message.parts) else (message.markdown or message.body)
-        return [(message.title, body)]
+    if len(bodies) <= 1:  # 兜底：理论上不会走到（整条已超限却只有一段），保持不丢内容
+        return [(title, body)]
     return list(zip(segment_titles(parts, len(bodies)), bodies))
 
 
@@ -113,8 +127,9 @@ def send(message: Message, env: Mapping[str, str], secrets: tuple[str, ...], **h
     priority = parse_priority(env.get("IGOTIFY_PRIORITY"))
     sleep_fn = http.get("sleep_fn") or time.sleep
     delay = parse_segment_delay(env.get("IGOTIFY_SEGMENT_DELAY"))
+    max_bytes = parse_max_bytes(env.get("IGOTIFY_MAX_BYTES"))
     if message.markdown or message.parts:
-        segments = plan_segments(message, parse_max_bytes(env.get("IGOTIFY_MAX_BYTES")))
+        segments = plan_segments(message, max_bytes)
         extras = MARKDOWN_EXTRAS
     else:
         segments, extras = [(message.title, message.body)], None
@@ -122,7 +137,7 @@ def send(message: Message, env: Mapping[str, str], secrets: tuple[str, ...], **h
     if total > 1:
         log(
             "INFO",
-            f"iGotify 日报分 {total} 段顺序提交到 Gotify，段间隔 {delay:g} 秒（每段独立重试）",
+            f"iGotify 日报超过 {max_bytes} 字节，分 {total} 段顺序提交到 Gotify，段间隔 {delay:g} 秒（每段独立重试）",
         )
     failed: list[int] = []
     for index, (title, body) in enumerate(segments, start=1):
@@ -146,6 +161,15 @@ def send(message: Message, env: Mapping[str, str], secrets: tuple[str, ...], **h
         else:
             if total > 1:
                 log("INFO", f"iGotify 第 {index}/{total} 段已提交到 Gotify")
+    if not failed:
+        log(
+            "INFO",
+            (
+                "iGotify 日报 1 条已提交到 Gotify"
+                if total == 1
+                else f"iGotify 日报 {total} 段均已提交到 Gotify"
+            ),
+        )
     if failed:
         # 部分失败也算该渠道失败：缺的段落里可能有关键内容，不能让「渠道成功」掩盖它
         kind = "全部失败" if len(failed) == total else "部分失败"

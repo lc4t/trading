@@ -228,11 +228,11 @@ def test_titles_are_numbered_and_first_carries_headline():
         assert byte_len(title) + byte_len(body) <= DEFAULT_MAX_BYTES
 
 
-def test_short_message_stays_single_with_original_title():
+def test_short_message_is_one_message_with_date_and_headline_title():
     parts = make_parts([hold_report()], [])
     message = Message("原标题", "精简", "主题", markdown=render_full(parts), parts=parts)
     segments = plan_segments(message, 8000)
-    assert segments == [("原标题", render_full(parts).rstrip("\n"))]
+    assert segments == [("trading 日报 2026-03-10 无信号变化", render_full(parts).rstrip("\n"))]
 
 
 def test_max_bytes_env_override_and_invalid_fallback(capsys):
