@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from typing import Callable, Iterable, Mapping
 from urllib import error, request
 
+from .chunking import DigestParts
+
 DEFAULT_TIMEOUT = 10.0
 DEFAULT_RETRIES = 2  # 首次失败后最多再试 2 次
 DEFAULT_BACKOFF = 1.0  # 指数退避基数：1s、2s
@@ -35,6 +37,9 @@ class Message:
     subject: str  # 邮件主题；其它渠道用 title
     markdown: str | None = None  # 完整版 Markdown：iGotify 的正文、邮件的纯文本版；None 时回退 body
     html: str | None = None  # 邮件 HTML 版（由 markdown 转换）；None 则只发纯文本
+    parts: DigestParts | None = (
+        None  # 结构化版本：iGotify 据此按字节分段；None 时按 markdown 通用切分
+    )
 
 
 class _NoRedirect(request.HTTPRedirectHandler):

@@ -435,19 +435,6 @@ def test_igotify_without_markdown_stays_plain_without_extras():
     assert body["message"] == "plain" and "extras" not in body
 
 
-def test_igotify_long_message_is_sent_whole_and_logs_hint(capsys):
-    seen, fake = capture()
-    long_md = "# t\n" + "- 行\n" * 5000
-    send_all(
-        Message("t", "b", "s", markdown=long_md),
-        {k: v for k, v in ENV.items() if k.startswith("IGOTIFY")},
-        urlopen=fake,
-        sleep_fn=lambda _: None,
-    )
-    assert json.loads(seen[0].data)["message"] == long_md
-    assert "未截断" in capsys.readouterr().err
-
-
 def test_resend_sends_html_and_text_versions():
     seen, fake = capture()
     message, md = make_message()

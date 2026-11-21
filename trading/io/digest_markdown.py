@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Iterable
 
+from .channels.chunking import Block, DigestParts, Unit, render_full
 from .channels.markup import md_escape
 from .digest import (
     ACTION_DISPLAY_LABEL,
@@ -250,22 +251,25 @@ def _rotation_detail(entry: Entry) -> list[str]:
         ("最近换仓", switches[0] if switches else DASH),
         ("上一次", switches[1] if len(switches) > 1 else DASH),
     ]
-    lines = [f"- **{k}**：{_e(v)}" for k, v in fields]
+    return [f"- **{k}**：{_e(v)}" for k, v in fields]
+
+
+def _ranking_block(raw: dict) -> Block | None:
     ranking = [r for r in raw.get("universeRanking") or [] if isinstance(r, dict)]
-    if ranking:
-        rows = [
-            [
-                r.get("rank", DASH),
-                ("✅ " if r.get("selected") else "") + _short_name(r.get("symbol"), r.get("name")),
-                DASH if r.get("momentum") is None else _num(r.get("momentum"), 4, True),
-                format_price(r.get("currentPrice")),
-                _num(r.get("targetWeight")),
-            ]
-            for r in ranking
+    if not ranking:
+        return None
+    rows = [
+        [
+            r.get("rank", DASH),
+            ("✅ " if r.get("selected") else "") + _short_name(r.get("symbol"), r.get("name")),
+            DASH if r.get("momentum") is None else _num(r.get("momentum"), 4, True),
+            format_price(r.get("currentPrice")),
+            _num(r.get("targetWeight")),
         ]
-        lines += ["", "**动量排名**（✅ 为目标持仓）", ""]
-        lines += _table(["#", "标的", "动量", "现价", "权重"], rows)
-    return lines
+        for r in ranking
+    ]
+    table = _table(["#", "标的", "动量", "现价", "权重"], rows)
+    return Block(("**动量排名**（✅ 为目标持仓）", "", *table), body_start=4, head=tuple(table[:2]))
 
 
 # ---------- 各小节 ----------
@@ -320,7 +324,12 @@ def _conclusion(
     return lines
 
 
-def _status_table(entries: list[Entry]) -> list[str]:
+STATUS_HEADERS = ["标的", "动作", "持仓", "浮盈", "止损位", "最近切换"]
+# 第 1 条放不下总表时，依次去掉最次要的列：最近切换 → 止损位 → 浮盈
+STATUS_COLUMN_SETS = ([0, 1, 2, 3, 4, 5], [0, 1, 2, 3, 4], [0, 1, 2, 3], [0, 1, 2])
+
+
+def _status_block(entries: list[Entry]) -> Block:
     rows = []
     for entry in entries:
         snap = (
@@ -330,7 +339,7 @@ def _status_table(entries: list[Entry]) -> list[str]:
         )
         rows.append(
             [
-                f"{entry.item.name}",
+                entry.item.name,
                 f"{ACTION_EMOJI[entry.item.action]} {ACTION_DISPLAY_LABEL[entry.item.action]}",
                 snap["position"],
                 snap["pnl"],
@@ -338,16 +347,31 @@ def _status_table(entries: list[Entry]) -> list[str]:
                 snap["switch"],
             ]
         )
-    return _table(["标的", "动作", "持仓", "浮盈", "止损位", "最近切换"], rows)
+
+    def variant(columns: list[int]) -> tuple[str, ...]:
+        table = _table(
+            [STATUS_HEADERS[i] for i in columns], [[row[i] for i in columns] for row in rows]
+        )
+        return ("## 状态总表", "", *table)
+
+    full = variant(STATUS_COLUMN_SETS[0])
+    return Block(
+        full,
+        body_start=4,
+        head=full[2:4],
+        alternatives=tuple(variant(cols) for cols in STATUS_COLUMN_SETS[1:]),
+    )
 
 
-def _perf_section(entries: list[Entry]) -> list[str]:
+def _perf_blocks(entries: list[Entry]) -> list[Block]:
     rows, annual, params = [], [], []
     for entry in entries:
         raw = entry.raw
         summary = raw.get("summary") if isinstance(raw.get("summary"), dict) else {}
 
-        def pick(summary_key: str, metric_name: str) -> object:
+        def pick(
+            summary_key: str, metric_name: str, raw: dict = raw, summary: dict = summary
+        ) -> object:
             value = summary.get(summary_key)
             return value if value is not None else _metric_value(raw, metric_name)
 
@@ -375,21 +399,33 @@ def _perf_section(entries: list[Entry]) -> list[str]:
                 f"- {_e(entry.item.name)}："
                 + " ｜ ".join(f"{_e(k)}={_e(v)}" for k, v in config.items())
             )
-    lines = _table(["标的", "年化", "最大回撤", "当前回撤", "夏普", "胜率"], rows)
+    table = _table(["标的", "年化", "最大回撤", "当前回撤", "夏普", "胜率"], rows)
+    blocks = [Block(("## 回测与绩效", "", *table), body_start=4, head=tuple(table[:2]))]
     if annual:
-        lines += ["", "**年度收益**", ""] + annual
+        blocks.append(Block(("**年度收益**", "", *annual), body_start=2))
     if params:
-        lines += ["", "**策略参数**", ""] + params
-    return lines
+        blocks.append(Block(("**策略参数**", "", *params), body_start=2))
+    return blocks
 
 
-def build_full_markdown(
+def _headline(entries: list[Entry]) -> str:
+    if not entries:
+        return "无数据"
+    parts = [
+        f"{label} {count}"
+        for label in ("买入", "换仓", "卖出")
+        if (count := sum(1 for e in entries if e.item.action == label))
+    ]
+    return "｜".join(parts) if parts else "无信号变化"
+
+
+def build_digest_parts(
     reports: list[ReportRecord],
     target_date: date,
     rotation_reports: list[dict] | None = None,
     warnings: Iterable[str] = (),
-) -> str:
-    """完整日报 Markdown；没有任何数据时在「今日结论」里直说，并保留边界声明。"""
+) -> DigestParts:
+    """完整日报的结构化版本：摘要块（第 1 条）+ 按标的/小节划分的单元，供分段与整体渲染。"""
     date_str = target_date.isoformat()
     entries: list[Entry] = []
     for record in reports:
@@ -405,23 +441,55 @@ def build_full_markdown(
     dates = [e.data_date for e in entries if e.data_date]
     latest = max(dates) if dates else None
 
-    lines = [f"# 📊 交易信号日报 · {date_str}", ""]
-    lines.append(f"数据截止 {latest or DASH} ｜ 报告日 {date_str} ｜ 共 {len(entries)} 项")
-    lines += ["", "## 今日结论", ""] + _conclusion(entries, target_date, warning_list, latest)
-
+    summary = [
+        Block((f"# 📊 交易信号日报 · {date_str}",)),
+        Block((f"数据截止 {latest or DASH} ｜ 报告日 {date_str} ｜ 共 {len(entries)} 项",)),
+        Block(
+            ("## 今日结论", "", *_conclusion(entries, target_date, warning_list, latest)),
+            body_start=2,
+        ),
+    ]
+    units: list[Unit] = []
     if entries:
-        lines += ["", "## 状态总表", ""] + _status_table(entries)
-        lines += ["", "## 标的详情"]
+        summary.append(_status_block(entries))
         for index, entry in enumerate(entries):
-            if index:
-                lines += ["", "---"]
             item = entry.item
-            lines += ["", f"**{ACTION_EMOJI[item.action]} {_e(item.name)}（{_e(item.key)}）**", ""]
-            lines += _rotation_detail(entry) if entry.kind == "rotation" else _symbol_detail(entry)
-        lines += ["", "## 回测与绩效", ""] + _perf_section(entries)
-
+            title = f"**{ACTION_EMOJI[item.action]} {_e(item.name)}（{_e(item.key)}）**"
+            bullets = _rotation_detail(entry) if entry.kind == "rotation" else _symbol_detail(entry)
+            blocks = [Block((title, "", *bullets), body_start=2)]
+            if entry.kind == "rotation" and (ranking := _ranking_block(entry.raw)):
+                blocks.append(ranking)
+            if index == 0:  # 小节标题跟第一个标的放在一起
+                first = blocks[0]
+                blocks[0] = Block(("## 标的详情", "", *first.lines), body_start=4)
+            units.append(Unit(f"{item.name}（{item.key}）", tuple(blocks), rule_before=index > 0))
+        units.append(Unit("回测与绩效", tuple(_perf_blocks(entries))))
     if warning_list:
-        lines += ["", "## 数据提示", ""] + [f"- {_e(w)}" for w in warning_list]
+        units.append(
+            Unit(
+                "数据提示",
+                (Block(("## 数据提示", "", *[f"- {_e(w)}" for w in warning_list]), body_start=2),),
+            )
+        )
+    units.append(
+        Unit(
+            "边界声明",
+            (Block(("## 边界声明", "", *[f"- {line}" for line in BOUNDARY_LINES]), body_start=2),),
+        )
+    )
+    return DigestParts(
+        label=f"trading 日报 {date_str}",
+        headline=_headline(entries),
+        summary=tuple(summary),
+        units=tuple(units),
+    )
 
-    lines += ["", "## 边界声明", ""] + [f"- {line}" for line in BOUNDARY_LINES]
-    return "\n".join(lines) + "\n"
+
+def build_full_markdown(
+    reports: list[ReportRecord],
+    target_date: date,
+    rotation_reports: list[dict] | None = None,
+    warnings: Iterable[str] = (),
+) -> str:
+    """完整日报 Markdown（不分段，邮件用）；没有任何数据时在「今日结论」里直说，并保留边界声明。"""
+    return render_full(build_digest_parts(reports, target_date, rotation_reports, warnings))

@@ -93,7 +93,7 @@ PUSHGO_URL=https://gateway.pushgo.dev/push
 | 渠道 | 必填变量 | 可选变量 | 说明 |
 | --- | --- | --- | --- |
 | Resend（邮件） | `RESEND_API_KEY`、`RESEND_FROM`、`RESEND_TO` | — | `RESEND_TO` 多个收件人用逗号分隔；`RESEND_FROM` 必须是已在 Resend 验证过的域名/地址；调用 `POST https://api.resend.com/emails`，同时带 `html`（由同一份 Markdown 转换，内联样式、适配深色模式与手机宽度、数据全部转义）与 `text`（Markdown 原文）两个版本，主题含日期与有信号的标的名 |
-| iGotify（Gotify 协议） | `IGOTIFY_URL`、`IGOTIFY_TOKEN` | `IGOTIFY_PRIORITY`（默认 5）、`IGOTIFY_ALLOW_HTTP=1`（仅本地测试允许 http） | 调用 `POST {IGOTIFY_URL}/message`，令牌走请求头 `X-Gotify-Key`；`IGOTIFY_URL` 末尾斜杠会被规范化，默认只接受 https；正文是**完整版 Markdown**（`extras: {"client::display": {"contentType": "text/markdown"}}`），标题与优先级沿用日报标题和 `IGOTIFY_PRIORITY` |
+| iGotify（Gotify 协议） | `IGOTIFY_URL`、`IGOTIFY_TOKEN` | `IGOTIFY_PRIORITY`（默认 5）、`IGOTIFY_MAX_BYTES`（单条上限，默认 3000 字节）、`IGOTIFY_ALLOW_HTTP=1`（仅本地测试允许 http） | 调用 `POST {IGOTIFY_URL}/message`，令牌走请求头 `X-Gotify-Key`；`IGOTIFY_URL` 末尾斜杠会被规范化，默认只接受 https；正文是**完整版 Markdown**（`extras: {"client::display": {"contentType": "text/markdown"}}`），标题与优先级沿用日报标题和 `IGOTIFY_PRIORITY` |
 
 ```bash
 uv run python -m trading.cli.digest --data-dir frontend/data
@@ -116,7 +116,7 @@ uv run python -m trading.cli.digest --data-dir frontend/data
 - 至少一个渠道发送成功则命令返回 0；没有任何已配置渠道，或所有已配置渠道都失败时，命令非零退出
 - 日志不会出现令牌、完整 URL 查询串或邮箱地址
 - **PushGo 保持精简正文不变**；iGotify 与邮件使用完整版（`trading/io/digest_markdown.py`），版式为：今日结论（逐个点名买入/换仓/卖出，无变化则写「今日无信号变化」，数据缺失或截止日不一致也写在这里）→ 状态总表（标的｜动作｜持仓｜浮盈｜止损位｜最近切换）→ 标的详情（每个标的同样的字段顺序，轮动策略附动量排名表）→ 回测与绩效（关键指标表、年度收益、策略参数）→ 数据提示 → 边界声明；不做任何长度截断
-- 完整版只用 iGotify 实测能渲染的 Markdown 子集：二级标题、粗体、列表、GFM 表格、分隔线（前后各留空行，否则 `---` 紧跟文字会被当成标题）；不用 HTML、图片、链接。HTML 在 iGotify 里不渲染，只用于邮件（由同一份 Markdown 转换，表格可横向滚动）。来自数据的文本都会转义，避免被渲染成链接或图片。iGotify 经 APNs 推送，单条负载上限约 4KB，消息较长时通知预览可能被系统截断，全文在应用内查看（日志会提示，正文本身不会被截断）
+- 完整版只用 iGotify 实测能渲染的 Markdown 子集：二级标题、粗体、列表、GFM 表格、分隔线（前后各留空行，否则 `---` 紧跟文字会被当成标题）；不用 HTML、图片、链接。HTML 在 iGotify 里不渲染，只用于邮件（由同一份 Markdown 转换，表格可横向滚动）。来自数据的文本都会转义，避免被渲染成链接或图片。iGotify 助手经 APNs 转发时有大小上限（实测 3307 字节可推送、3468 字节加密报错，具体值未探测），所以 iGotify 渠道按 UTF-8 字节分段：默认单条（含标题）不超过 `IGOTIFY_MAX_BYTES`=3000，第 1 条固定是「今日结论 + 状态总表」（放不下时依次去掉最近切换、止损位、浮盈列），其余按标的/小节装箱，绝不在表格行、列表项、标题中间切断，表格在续段重复表头，续段标注「（续）」；标题带序号（如 `trading 日报 2026-03-10 (2/4)`），第 1 条带结论摘要；分段之间间隔约 1 秒顺序发送、每段独立重试；任一段失败会在日志写明第几段，该渠道记为「部分失败」（算渠道失败，其余渠道结果照旧判定）。邮件不分段，发完整版
 - 单标的 JSON 的 `latestSignal` 新增 `stopLoss`（类型/止损价/距现价%）与 `conditions`（触发条件）两个可选字段，供完整版日报使用；旧前端忽略未知字段
 
 ## 交互式 API（2.0 新增）

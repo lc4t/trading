@@ -4,6 +4,7 @@
 
     uv run python -m trading.cli.digest --data-dir frontend/data
 """
+
 from __future__ import annotations
 
 import argparse
@@ -23,7 +24,8 @@ from ..io.digest import (
     load_rotation_reports,
     today_in_timezone,
 )
-from ..io.digest_markdown import build_full_markdown
+from ..io.channels.chunking import render_full
+from ..io.digest_markdown import build_digest_parts
 
 
 def parse_date(value: str) -> date:
@@ -94,13 +96,15 @@ def main() -> int:
 
     subject = build_email_subject(title, reports, target_date, rotation_reports)
     # PushGo 沿用精简正文；iGotify 与邮件用完整版 Markdown（邮件另带由它转换的 HTML）
-    full_markdown = build_full_markdown(reports, target_date, rotation_reports, warnings)
+    parts = build_digest_parts(reports, target_date, rotation_reports, warnings)
+    full_markdown = render_full(parts)
     message = Message(
         title=title,
         body=body,
         subject=subject,
         markdown=full_markdown,
         html=markdown_to_html(full_markdown, subject),
+        parts=parts,
     )
     result = send_all(
         message,
