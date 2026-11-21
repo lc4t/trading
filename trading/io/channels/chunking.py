@@ -52,6 +52,7 @@ class Unit:
     label: str  # 续段标题用
     blocks: tuple[Block, ...]
     rule_before: bool = False  # 与上一个单元之间是否画 ---
+    break_before: bool = False  # True：从新的一条消息开始（用于固定「结论 / 总览 / 详情」各占一条）
 
 
 @dataclass(frozen=True)
@@ -210,8 +211,8 @@ def pack(parts: DigestParts, budget: int) -> list[str]:
     """分成若干条正文，每条 ≤ budget 字节；拼起来不丢内容。第 1 条只放摘要块。"""
     budget = max(budget, MIN_BUDGET)
     whole = render_full(parts).rstrip("\n")
-    if byte_len(whole) <= budget:  # 整份放得下就只发一条
-        return [whole]
+    if byte_len(whole) <= budget and not any(u.break_before for u in parts.units):
+        return [whole]  # 整份放得下就只发一条
     first: list[str] = []
     spill: tuple[Block, ...] = ()
     for index, block in enumerate(parts.summary):
@@ -237,6 +238,8 @@ def pack(parts: DigestParts, budget: int) -> list[str]:
             cur.clear()
 
     for unit in units:
+        if unit.break_before:
+            flush()
         text = SEP.join(block.text for block in unit.blocks)
         extra = [RULE, text] if (cur and unit.rule_before) else [text]
         if byte_len(SEP.join([*cur, *extra])) <= budget:

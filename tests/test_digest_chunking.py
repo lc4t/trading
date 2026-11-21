@@ -225,7 +225,7 @@ def test_short_message_stays_single_with_original_title():
     parts = make_parts([hold_report()], [])
     message = Message("原标题", "精简", "主题", markdown=render_full(parts), parts=parts)
     segments = plan_segments(message, 8000)
-    assert segments == [("原标题", render_full(parts))]
+    assert segments == [("原标题", render_full(parts).rstrip("\n"))]
 
 
 def test_max_bytes_env_override_and_invalid_fallback(capsys):

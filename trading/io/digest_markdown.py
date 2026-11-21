@@ -556,13 +556,17 @@ def _headline(entries: list[Entry]) -> str:
     return "｜".join(parts) if parts else "无信号变化"
 
 
-def build_digest_parts(
-    reports: list[ReportRecord],
-    target_date: date,
-    rotation_reports: list[dict] | None = None,
-    warnings: Iterable[str] = (),
-) -> DigestParts:
-    """完整日报的结构化版本：摘要块（第 1 条）+ 按标的/小节划分的单元，供分段与整体渲染。"""
+@dataclass(frozen=True)
+class Collected:
+    entries: list[Entry]
+    book: NameBook
+    latest: str | None  # 各标的数据截止日里最新的一天
+
+
+def collect_entries(
+    reports: list[ReportRecord], target_date: date, rotation_reports: list[dict] | None
+) -> Collected:
+    """把单标的与轮动报告整理成按动作优先级排序的条目，并建好名称簿。"""
     date_str = target_date.isoformat()
     rotation_reports = rotation_reports or []
     book = NameBook.from_reports(reports, rotation_reports)
@@ -576,9 +580,21 @@ def build_digest_parts(
             Entry(build_rotation_item(raw, date_str), "rotation", raw, _data_date("rotation", raw))
         )
     entries.sort(key=lambda e: (ACTION_PRIORITY.get(e.item.action, 99), e.item.key))
-    warning_list = [book.annotate(w) for w in warnings if w]
     dates = [e.data_date for e in entries if e.data_date]
-    latest = max(dates) if dates else None
+    return Collected(entries, book, max(dates) if dates else None)
+
+
+def build_digest_parts(
+    reports: list[ReportRecord],
+    target_date: date,
+    rotation_reports: list[dict] | None = None,
+    warnings: Iterable[str] = (),
+) -> DigestParts:
+    """完整日报的结构化版本：摘要块（第 1 条）+ 按标的/小节划分的单元，供分段与整体渲染。"""
+    date_str = target_date.isoformat()
+    collected = collect_entries(reports, target_date, rotation_reports)
+    entries, book, latest = collected.entries, collected.book, collected.latest
+    warning_list = [book.annotate(w) for w in warnings if w]
 
     summary = [
         Block((f"# 📊 交易信号日报 · {date_str}",)),

@@ -24,8 +24,8 @@ from ..io.digest import (
     load_rotation_reports,
     today_in_timezone,
 )
-from ..io.channels.chunking import render_full
-from ..io.digest_markdown import build_digest_parts
+from ..io.digest_markdown import build_full_markdown
+from ..io.digest_push import build_push_parts
 
 
 def parse_date(value: str) -> date:
@@ -95,9 +95,9 @@ def main() -> int:
         return 0
 
     subject = build_email_subject(title, reports, target_date, rotation_reports)
-    # PushGo 沿用精简正文；iGotify 与邮件用完整版 Markdown（邮件另带由它转换的 HTML）
-    parts = build_digest_parts(reports, target_date, rotation_reports, warnings)
-    full_markdown = render_full(parts)
+    # PushGo 沿用精简正文；邮件用完整版 Markdown（另带 HTML）；iGotify 用手机精简版（结论/总览/需关注分条发送）
+    full_markdown = build_full_markdown(reports, target_date, rotation_reports, warnings)
+    parts = build_push_parts(reports, target_date, rotation_reports, warnings)
     message = Message(
         title=title,
         body=body,

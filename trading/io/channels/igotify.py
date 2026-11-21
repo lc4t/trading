@@ -76,7 +76,8 @@ def plan_segments(message: Message, max_bytes: int) -> list[tuple[str, str]]:
     worst_title = f"{parts.label} {parts.headline} (99/99)".strip()
     bodies = pack(parts, max_bytes - byte_len(worst_title))
     if len(bodies) <= 1:
-        return [(message.title, message.markdown or (bodies[0] if bodies else message.body))]
+        body = bodies[0] if (bodies and message.parts) else (message.markdown or message.body)
+        return [(message.title, body)]
     return list(zip(segment_titles(parts, len(bodies)), bodies))
 
 
