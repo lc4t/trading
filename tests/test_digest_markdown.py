@@ -167,53 +167,127 @@ def build(reports=None, rotations=None, warnings=()):
     )
 
 
-def test_full_markdown_contains_all_decision_fields():
+def buy_report():
+    r = hold_report("示例买入ETF")
+    r["symbol"] = "588000.SS"
+    r["latestSignal"].update(action="买入", conditions=["MA6(1.5) > MA15(1.4)"])
+    r["latestSignal"].pop("stopLoss")
+    r["positionInfo"] = None
+    r["recentTrades"] = []
+    return r
+
+
+def section(md, title):
+    """取 `## title` 小节的正文。"""
+    start = md.index(f"## {title}")
+    rest = md[start + len(title) + 3 :]
+    end = rest.find("\n## ")
+    return rest if end < 0 else rest[:end]
+
+
+def test_conclusion_comes_first_and_names_every_trade_signal():
+    md = build(reports=[hold_report(), buy_report()])
+    order = [
+        md.index(f"## {t}") for t in ("今日结论", "状态总表", "标的详情", "回测与绩效", "边界声明")
+    ]
+    assert order == sorted(order)
+    conclusion = section(md, "今日结论")
+    assert "示例买入ETF" in conclusion and "买入：MA6(1.5) > MA15(1.4)" in conclusion
+    assert "动量轮动 Top-1" in conclusion and "换仓：下次预期换股" in conclusion
+    assert "示例持有ETF" not in conclusion  # 无动作的不进结论
+    assert len([ln for ln in conclusion.splitlines() if ln.startswith("- ")]) <= 3
+
+
+def test_conclusion_says_no_change_when_no_signal():
+    rotation = rotation_report()
+    rotation["nextSignal"].update(
+        action="HOLD", reason="动量最强仍为 518880.SS", rotateTo="518880.SS"
+    )
+    md = build(reports=[hold_report()], rotations=[rotation])
+    assert "今日无信号变化：持有 2 ｜ 空仓 0" in section(md, "今日结论")
+
+
+def test_conclusion_flags_stale_data_and_missing_data():
+    stale = buy_report()
+    stale["dateRange"]["end"] = "2026-03-06"
+    md = build(reports=[hold_report(), stale], warnings=["跳过损坏 JSON"])
+    conclusion = section(md, "今日结论")
+    assert (
+        "数据截止日不一致，以 2026-03-10 为准" in conclusion
+        and "示例买入ETF（2026-03-06）" in conclusion
+    )
+    assert "1 条数据提示" in conclusion and "## 数据提示" in md and "跳过损坏 JSON" in md
+
+    empty = build(reports=[], rotations=[])
+    assert "未取得任何当日数据" in section(empty, "今日结论")
+    assert "## 状态总表" not in empty and "## 边界声明" in empty
+
+
+def test_status_table_is_one_row_per_item_with_fixed_columns():
+    md = build(reports=[hold_report(), buy_report()])
+    table = [ln for ln in section(md, "状态总表").splitlines() if ln.startswith("|")]
+    assert table[0] == "| 标的 | 动作 | 持仓 | 浮盈 | 止损位 | 最近切换 |"
+    assert len(table) == 2 + 3
+    hold_row = next(r for r in table if "示例持有ETF" in r)
+    assert "🟡 持有" in hold_row and "1000股" in hold_row and "+12.18%" in hold_row
+    assert "1.111" in hold_row and "2026-02-01 买入" in hold_row
+    rotation_row = next(r for r in table if "动量轮动" in r)
+    assert (
+        "🔄 换仓" in rotation_row and "+5.00%" in rotation_row and "2026-02-20 入场" in rotation_row
+    )
+
+
+def test_details_have_identical_field_order_per_kind():
+    md = build(reports=[hold_report(), buy_report()])
+    details = section(md, "标的详情")
+    symbol_blocks = [b for b in details.split("---") if "**最近交易**" in b]
+    assert len(symbol_blocks) == 2
+    fields = [re.findall(r"- \*\*(.+?)\*\*：", b) for b in symbol_blocks]
+    assert fields[0] == fields[1] == ["动作", "现价", "持仓", "止损", "依据", "最近交易", "上一笔"]
+    rotation_fields = re.findall(
+        r"- \*\*(.+?)\*\*：", next(b for b in details.split("---") if "最近换仓" in b)
+    )
+    assert rotation_fields == ["动作", "持仓", "目标", "止损", "依据", "最近换仓", "上一次"]
+
+
+def test_details_keep_decision_content_and_ranking_table():
     md = build()
     for expected in (
-        "# 📊 交易信号日报 · 2026-03-10",
-        "## 🎯 信号总览",
-        "## 📌 详情",
-        "## ⚠️ 边界声明",
-        "示例持有ETF",
-        "159941.SZ",
-        "持有",
-        "浮动盈亏",  # 动作/持仓
-        "止损位：吊灯止损 1.111",
-        "距现价 9.97%",
-        "触发条件：MA18",  # 止损与条件
-        "交易记录：2026-02-01 BUY",
-        "原因：MA 金叉",
-        "原因：吊灯止损触发",  # 最近交易与原因
-        "数据日期：2026-03-10",
-        "年化收益率 12.35%",
-        "最大回撤 -24.47%",
-        "总盈亏 ¥1,234.50".replace(",", ""),
-        "夏普比率 1.23",
-        "胜率 55.50%",
-        "平均持仓 21天",
-        "年度收益",
-        "2025 +8.12%",
-        "轮动目标：518880.SS（华安易富黄金ETF） → 513100.SS（国泰纳斯达克100ETF）",
-        "**动量排名**",
-        "1. ✅ 国泰纳斯达克100ETF（513100.SS） 动量 +0.0812",
-        "目标权重 0.95",
-        "动量 暂无",
-        "最近换仓：159915.SZ（创业板ETF）",
-        "收益 +10.00%",
-        "下次预期动作：换仓",
-        "总收益 +45.67%",
-        "最大回撤 -21.30%",
-        "top\\_n=1",
-        "不构成投资建议",
+        "止损**：吊灯止损 1.111（距现价 9.97%）",
+        "依据**：MA18(1.20) > MA25(1.15)",
+        "最近交易**：2026-02-01 买入 @1.100 ×1000（MA 金叉）",
+        "吊灯止损触发",
+        "目标**：华安易富黄金ETF → 国泰纳斯达克100ETF",
+        "最近换仓**：2026-01-02 → 2026-02-20 创业板ETF",
+        "| 1 | ✅ 国泰纳斯达克100ETF | +0.0812 | 1.900 | 0.95 |",
+        "| 3 | 创业板ETF | — | 3.100 | 0.00 |",
+        "| # | 标的 | 动量 | 现价 | 权重 |",
     ):
         assert expected in md, expected
-    assert "不应出现在消息里的说明文字" not in md  # 指标说明是静态文档，不是意见
 
 
-def test_markdown_uses_only_supported_syntax_no_tables_or_html():
+def test_performance_section_is_compact():
     md = build()
-    assert "|" not in md.replace("｜", "")  # 无表格管道符
-    assert "<" not in md and "![" not in md and "](" not in md  # 无 HTML/图片/链接
+    perf = section(md, "回测与绩效")
+    assert "| 标的 | 年化 | 最大回撤 | 当前回撤 | 夏普 | 胜率 |" in perf
+    assert "| 示例持有ETF | +12.35% | -24.47% | — | 1.23 | 55.50% |" in perf
+    assert "+9.80%" in perf and "-21.30%" in perf and "-3.20%" in perf
+    assert "**年度收益**" in perf and "2025 +8.12%" in perf and "top\\_n=1" in perf
+    assert "不应出现在消息里的说明文字" not in md and "Beta" not in md
+
+
+def test_layout_rules_for_ios_renderer():
+    md = build(reports=[hold_report(), buy_report()])
+    lines = md.split("\n")
+    for i, line in enumerate(lines):
+        if line.strip() == "---":  # 前后必须空行，否则被当成 Setext 二级标题
+            assert lines[i - 1] == "" and lines[i + 1] == "", i
+    headings = {len(m.group(1)) for m in re.finditer(r"^(#+) ", md, re.M)}
+    assert headings <= {1, 2}  # 标题不超过两级
+    assert not re.search(r"(?<!\\)[<\[]", md) and "![" not in md  # 无 HTML/链接/图片
+    for block in re.findall(r"(?:^\|.*\n)+", md, re.M):  # 每张表各行列数一致
+        counts = {len(re.findall(r"(?<!\\)\|", row)) for row in block.strip().splitlines()}
+        assert len(counts) == 1 and next(iter(counts)) <= 7  # 最多 6 列
 
 
 def test_long_content_is_never_truncated():
@@ -249,6 +323,25 @@ def test_markdown_to_html_structure_and_escaping():
     assert 'name="viewport"' in html_doc and "max-width:640px" in html_doc
     assert "prefers-color-scheme:dark" in html_doc and 'name="color-scheme"' in html_doc
     assert "style=" in html_doc  # 样式内联
+
+
+def test_markdown_table_converts_with_escaping_and_dark_mode_hooks():
+    md = "| 标的 | 值 |\n|---|---|\n| <b>x</b> \\| y | **1** |\n| 少列 |\n\n段落"
+    html_doc = markdown_to_html(md)
+    assert "<table" in html_doc and html_doc.count("<tr>") == 3  # 表头 + 2 行
+    assert html_doc.count("<th ") == 2 and html_doc.count("<td ") == 4  # 少列补空
+    assert "&lt;b&gt;x&lt;/b&gt; | y" in html_doc and "<b>" not in html_doc
+    assert "overflow-x:auto" in html_doc and "border:1px solid" in html_doc
+    assert "th.c{background:#1c2128" in html_doc and "<p " in html_doc
+    assert "|---|" not in html_doc
+
+
+def test_full_digest_html_has_tables_and_no_raw_markup():
+    md = build()
+    html_doc = markdown_to_html(md, "主题")
+    assert html_doc.count("<table") == 3  # 状态总表 + 动量排名 + 绩效
+    assert "<h2" in html_doc and "<hr" in html_doc and "<strong>" in html_doc
+    assert "|---|" not in html_doc and "**" not in html_doc
 
 
 def test_unclosed_bold_does_not_break_tags():

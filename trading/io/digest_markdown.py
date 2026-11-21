@@ -1,16 +1,20 @@
 """完整版日报（Markdown）：给 iGotify 与邮件用，PushGo 的精简正文保持不变。
 
-与 `build_digest` 的区别：精简正文只挑「信号动作/持仓/浮盈」几行；这里把 JSON 里和操作相关的
-内容全部写出来——止损位、触发条件、最近交易与换仓（含原因）、轮动目标与各标的动量排名、绩效指标、
-年度收益、策略参数、数据日期、边界声明——不做任何长度截断。
+版式（先结论、再总表、再细节、最后绩效）：
+    # 标题 + 数据截止行
+    ## 今日结论      —— 今天要不要动作，逐个点名；数据缺失/落后也写在这里
+    ## 状态总表      —— 每个标的/策略一行：标的｜动作｜持仓｜浮盈｜止损位｜最近切换
+    ## 标的详情      —— 每个标的同样的字段顺序；轮动策略多一张动量排名表
+    ## 回测与绩效    —— 一张关键指标表 + 年度收益 + 策略参数
+    ## 数据提示 / 边界声明
 
-语法只用 iGotify/Gotify 客户端确定支持的子集：标题、粗体、无序/有序列表、分隔线；
-不用表格（宽表在手机上会溢出，且 iOS 端渲染范围未公开）、不用图片/HTML；
-所有来自数据的文本先经 `md_escape`，防止被解析成链接/图片/强调。
+语法只用 iGotify 实测能渲染的子集：二级标题、粗体、列表、GFM 表格、分隔线（前后各留空行，
+否则 `---` 紧跟文字会被当成 Setext 标题）。标题只用两级；来自数据的文本一律经转义，防止注入。
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date
 from typing import Iterable
 
@@ -19,6 +23,7 @@ from .digest import (
     ACTION_DISPLAY_LABEL,
     ACTION_EMOJI,
     ACTION_PRIORITY,
+    TRADE_ACTIONS,
     DigestItem,
     ReportRecord,
     build_rotation_item,
@@ -28,225 +33,353 @@ from .digest import (
     resolve_symbol_name,
 )
 
-RECENT_TRADES_SHOWN = 5
-RECENT_ROTATIONS_SHOWN = 3
+RECENT_ROTATIONS_SHOWN = 2
+MAX_LAG_DAYS = 5  # 数据截止日比报告日早超过这个天数（长假之外）就提示
+DASH = "—"
 
 # 与前端 QuantTradeReport.tsx 的单位口径一致
-PERCENT_METRICS = {
-    "年化收益率",
-    "复合年化收益",
-    "Alpha",
-    "最大回撤",
-    "当前回撤",
-    "波动率",
-    "胜率",
-    "持仓比例",
-    "最大亏损比例",
-}
-LOSS_MAGNITUDE_METRICS = {"最大回撤", "当前回撤", "最大亏损金额", "最大亏损比例", "平均亏损"}
-MONEY_METRICS = {"总盈亏", "平均盈利", "平均亏损", "最大亏损金额"}
-METRIC_GROUPS = (
-    ("returnMetrics", "收益"),
-    ("riskMetrics", "风险"),
-    ("riskAdjustedMetrics", "风险调整"),
-    ("tradingMetrics", "交易"),
-    ("positionMetrics", "持仓"),
-    ("benchmarkMetrics", "基准"),
-)
+LOSS_MAGNITUDE_METRICS = {"最大回撤", "当前回撤"}
 
 BOUNDARY_LINES = (
     "以上是策略对历史行情的机械计算结果（信号监测），仅供参考，不构成投资建议；系统只提示、不自动下单。",
     "止损位、动量排名等是策略的参考位与排序，不是委托价；回测与历史表现不代表未来收益。",
     "各标的数据截止日以「数据日期」为准；数据缺失或滞后时，该标的的结论可能已过期。",
 )
+TRADE_LABELS = {"BUY": "买入", "SELL": "卖出"}
+
+
+@dataclass(frozen=True)
+class Entry:
+    item: DigestItem
+    kind: str  # "symbol" | "rotation"
+    raw: dict
+    data_date: str | None
+
+
+# ---------- 小工具 ----------
 
 
 def _e(value: object) -> str:
     return md_escape(value)
 
 
+def _cell(value: object) -> str:
+    return md_escape(value).replace("|", "\\|")
+
+
+def _table(headers: list[str], rows: list[list[object]]) -> list[str]:
+    lines = [
+        "| " + " | ".join(_cell(h) for h in headers) + " |",
+        "|" + "|".join("---" for _ in headers) + "|",
+    ]
+    lines.extend("| " + " | ".join(_cell(c) for c in row) + " |" for row in rows)
+    return lines
+
+
 def _num(value: object, digits: int = 2, signed: bool = False) -> str:
     try:
         number = float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
-        return "暂无"
+        return DASH
     return f"{number:+.{digits}f}" if signed else f"{number:.{digits}f}"
 
 
-def _metric_text(metric: dict) -> str:
-    name = str(metric.get("name") or "")
-    value = metric.get("value")
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        shown = _e(value if value not in (None, "") else "暂无")
-    else:
-        signed = -value if name in LOSS_MAGNITUDE_METRICS and value > 0 else value
-        if name in PERCENT_METRICS:
-            shown = f"{signed:.2f}%"
-        elif name in MONEY_METRICS:
-            shown = f"¥{signed:.2f}"
-        elif isinstance(value, int):
-            shown = f"{value:,}"
-        else:
-            shown = f"{signed:.2f}"
-    return f"{_e(name)} {shown}"
+def _pct(value: object, signed: bool = True) -> str:
+    text = _num(value, 2, signed)
+    return text if text == DASH else f"{text}%"
 
 
-def _metric_lines(raw: dict) -> list[str]:
-    lines = []
-    for key, label in METRIC_GROUPS:
-        metrics = [m for m in raw.get(key) or [] if isinstance(m, dict) and m.get("name")]
-        if metrics:
-            lines.append(f"- **{label}**：" + " ｜ ".join(_metric_text(m) for m in metrics))
-    return lines
+def _label(symbol: object, name: object = None) -> str:
+    text = str(symbol or "").strip()
+    if not text:
+        return DASH
+    resolved = resolve_symbol_name(text, None if name in (None, "") else str(name))
+    return text if resolved == text else f"{resolved}（{text}）"
 
 
-def _annual_line(raw: dict) -> list[str]:
-    years = [y for y in raw.get("annualReturns") or [] if isinstance(y, dict) and "year" in y]
-    if not years:
-        return []
-    parts = [f"{_e(y['year'])} {_num(y.get('value'), 2, True)}%" for y in years]
-    return ["- **年度收益**：" + " ｜ ".join(parts)]
+def _short_name(symbol: object, name: object = None) -> str:
+    text = str(symbol or "").strip()
+    return resolve_symbol_name(text, None if name in (None, "") else str(name)) if text else DASH
 
 
-def _symbol_extra_lines(raw: dict) -> list[str]:
-    lines: list[str] = []
+def _trade_text(trade: dict | None) -> str:
+    if not trade:
+        return DASH
+    action = TRADE_LABELS.get(str(trade.get("action")).upper(), str(trade.get("action") or "交易"))
+    parts = [f"{format_trade_date(trade.get('date'))} {action} @{format_price(trade.get('price'))}"]
+    if trade.get("quantity") not in (None, ""):
+        parts[0] += f" ×{trade['quantity']}"
+    if trade.get("profitLossPercentage") is not None:
+        parts.append(_pct(trade["profitLossPercentage"]))
+    text = "，".join(parts)
+    reason = str(trade.get("reason") or "").strip()
+    return f"{text}（{reason}）" if reason else text
+
+
+def _metric_value(raw: dict, name: str) -> object:
+    for key in ("returnMetrics", "riskMetrics", "riskAdjustedMetrics", "tradingMetrics"):
+        for metric in raw.get(key) or []:
+            if isinstance(metric, dict) and metric.get("name") == name:
+                return metric.get("value")
+    for key in ("metrics",):
+        groups = raw.get(key)
+        if isinstance(groups, dict):
+            for group in groups.values():
+                for metric in group or []:
+                    if isinstance(metric, dict) and metric.get("name") == name:
+                        return metric.get("value")
+    return None
+
+
+# ---------- 每个标的的快照与细节 ----------
+
+
+def _symbol_snapshot(raw: dict) -> dict[str, str]:
     latest = raw.get("latestSignal") or {}
-    date_range = raw.get("dateRange") or {}
-    lines.append(
-        f"数据日期：{_e(format_trade_date(date_range.get('end') or latest.get('timestamp')))}"
-        f"，报告日期：{_e(raw.get('reportDate') or '暂无')}"
-    )
-    prices = latest.get("prices") or {}
-    if prices:
-        lines.append(
-            "最新价："
-            + " ｜ ".join(
-                f"{label} {format_price(prices.get(key))}"
-                for key, label in (("open", "开"), ("high", "高"), ("low", "低"), ("close", "收"))
-                if prices.get(key) is not None
-            )
-        )
-    stop = latest.get("stopLoss")
-    if isinstance(stop, dict) and stop.get("price") is not None:
-        lines.append(
-            f"止损位：{_e(stop.get('type') or '止损')} {format_price(stop.get('price'))}"
-            f"（距现价 {_num(stop.get('distancePct'))}%）"
-        )
-    for condition in latest.get("conditions") or []:
-        lines.append(f"触发条件：{_e(condition)}")
     position = raw.get("positionInfo") or {}
-    if position:
-        lines.append(
-            f"持仓：{_e(position.get('position_size', '暂无'))} 股，"
-            f"成本 {_num(position.get('cost'))}，市值 {_num(position.get('current_value'))}，"
-            f"浮盈亏 {_num(position.get('unrealized_pnl'), 2, True)}"
-        )
+    stop = latest.get("stopLoss") if isinstance(latest.get("stopLoss"), dict) else None
     trades = [t for t in raw.get("recentTrades") or [] if isinstance(t, dict)]
-    for trade in reversed(trades[-RECENT_TRADES_SHOWN:]):
-        pnl = trade.get("profitLossPercentage")
-        pnl_text = f"，收益 {_num(pnl, 2, True)}%" if pnl is not None else ""
-        reason = f"，原因：{_e(trade['reason'])}" if trade.get("reason") else ""
-        lines.append(
-            f"交易记录：{_e(format_trade_date(trade.get('date')))} {_e(trade.get('action'))} "
-            f"价 {format_price(trade.get('price'))} 量 {_e(trade.get('quantity', '暂无'))}{pnl_text}{reason}"
-        )
-    return lines
-
-
-def _rotation_extra_lines(raw: dict) -> list[str]:
-    lines: list[str] = []
-    next_signal = raw.get("nextSignal") or {}
-    date_range = raw.get("dateRange") or {}
-    evaluated = next_signal.get("evaluatedAt")
-    lines.append(
-        f"数据日期：{_e(format_trade_date(evaluated))}，报告日期：{_e(raw.get('reportDate') or '暂无')}"
-        f"，回测区间：{_e(format_trade_date(date_range.get('start')))} ~ "
-        f"{_e(format_trade_date(date_range.get('end')))}"
-    )
-    rotate_from, rotate_to = next_signal.get("rotateFrom"), next_signal.get("rotateTo")
-    if rotate_from or rotate_to:
-        lines.append(
-            f"轮动目标：{_e(_label(rotate_from) if rotate_from else '空仓')} → "
-            f"{_e(_label(rotate_to) if rotate_to else '空仓')}"
-        )
-    rotations = [r for r in raw.get("rotations") or [] if isinstance(r, dict)]
-    for rotation in reversed(rotations[-RECENT_ROTATIONS_SHOWN:]):
-        lines.append(
-            f"最近换仓：{_e(_label(rotation.get('symbol')))}，"
-            f"{_e(format_trade_date(rotation.get('entryDate')))} → "
-            f"{_e(format_trade_date(rotation.get('exitDate')))}，持有 {_e(rotation.get('holdingDays', '暂无'))} 天，"
-            f"入场 {format_price(rotation.get('entryPrice'))} 出场 {format_price(rotation.get('exitPrice'))}，"
-            f"收益 {_num(rotation.get('periodReturnPct'), 2, True)}%"
-        )
-    return lines
-
-
-def _label(symbol: object) -> str:
-    text = str(symbol or "暂无")
-    name = resolve_symbol_name(text)
-    return text if name == text else f"{text}（{name}）"
-
-
-def _ranking_lines(raw: dict) -> list[str]:
-    ranking = [r for r in raw.get("universeRanking") or [] if isinstance(r, dict)]
-    if not ranking:
-        return []
-    lines = ["**动量排名**（候选池按动量降序，✅ 为目标持仓）："]
-    for entry in ranking:
-        mark = "✅ " if entry.get("selected") else ""
-        weight = _num(entry.get("targetWeight"), 2)
-        momentum = "暂无" if entry.get("momentum") is None else _num(entry.get("momentum"), 4, True)
-        name = resolve_symbol_name(str(entry.get("symbol") or ""), entry.get("name"))
-        lines.append(
-            f"{entry.get('rank', '-')}. {mark}{_e(name)}（{_e(entry.get('symbol'))}）"
-            f" 动量 {momentum} ｜ 现价 {format_price(entry.get('currentPrice'))} ｜ 目标权重 {weight}"
-        )
-    return lines
-
-
-def _summary_line(raw: dict) -> list[str]:
-    summary = raw.get("summary")
-    if not isinstance(summary, dict):
-        return []
-    parts = [
-        ("总收益", summary.get("totalReturnPct"), "%", True),
-        ("年化", summary.get("annualReturn"), "%", True),
-        (
-            "最大回撤",
-            None if summary.get("maxDrawdown") is None else -abs(float(summary["maxDrawdown"])),
-            "%",
-            True,
+    last = trades[-1] if trades else None
+    return {
+        "position": f"{position['position_size']}股" if position.get("position_size") else "空仓",
+        "pnl": _pct(position.get("unrealized_pnl_pct")) if position else DASH,
+        "stop": format_price(stop.get("price")) if stop and stop.get("price") is not None else DASH,
+        "switch": (
+            f"{format_trade_date(last.get('date'))} "
+            f"{TRADE_LABELS.get(str(last.get('action')).upper(), '')}".strip()
+            if last
+            else DASH
         ),
-        ("夏普", summary.get("sharpe"), "", False),
-        ("波动率", summary.get("volatility"), "%", False),
+    }
+
+
+def _rotation_snapshot(raw: dict) -> dict[str, str]:
+    holding = raw.get("currentHolding") or {}
+    rotations = [r for r in raw.get("rotations") or [] if isinstance(r, dict)]
+    if holding:
+        switch = f"{format_trade_date(holding.get('since'))} 入场"
+    elif rotations:
+        switch = f"{format_trade_date(rotations[-1].get('exitDate'))} 清仓"
+    else:
+        switch = DASH
+    return {
+        "position": _short_name(holding.get("symbol"), holding.get("name")) if holding else "空仓",
+        "pnl": _pct(holding.get("unrealizedPnlPct")) if holding else DASH,
+        "stop": DASH,
+        "switch": switch,
+    }
+
+
+def _basis(entry: Entry) -> str:
+    """一句话依据：买入/卖出条件，或轮动的下次动作原因。"""
+    raw = entry.raw
+    if entry.kind == "rotation":
+        return str((raw.get("nextSignal") or {}).get("reason") or "").strip() or DASH
+    latest = raw.get("latestSignal") or {}
+    conditions = [str(c) for c in latest.get("conditions") or [] if c]
+    sells = [
+        t
+        for t in raw.get("recentTrades") or []
+        if isinstance(t, dict) and str(t.get("action")).upper() == "SELL"
     ]
-    text = " ｜ ".join(
-        f"{name} {_num(v, 2, signed)}{unit}" for name, v, unit, signed in parts if v is not None
+    if entry.item.action == "卖出" and sells and sells[-1].get("reason"):
+        return str(sells[-1]["reason"]).strip()
+    if conditions:
+        return "；".join(conditions)
+    return {"买入": "出现买入信号", "卖出": "触发卖出条件"}.get(entry.item.action, DASH)
+
+
+def _symbol_detail(entry: Entry) -> list[str]:
+    raw, item = entry.raw, entry.item
+    latest = raw.get("latestSignal") or {}
+    prices = latest.get("prices") or {}
+    position = raw.get("positionInfo") or {}
+    stop = latest.get("stopLoss") if isinstance(latest.get("stopLoss"), dict) else None
+    trades = [t for t in raw.get("recentTrades") or [] if isinstance(t, dict)]
+    price_text = format_price(prices.get("close")) if prices.get("close") is not None else DASH
+    holding_text = (
+        f"{position.get('position_size', DASH)} 股 ｜ 成本 {_num(position.get('cost'))} ｜ "
+        f"市值 {_num(position.get('current_value'))} ｜ 浮盈 {_pct(position.get('unrealized_pnl_pct'))}"
+        if position
+        else "空仓"
     )
-    return [f"- **回测概览**：{text}"] if text else []
-
-
-def _config_line(raw: dict) -> list[str]:
-    config = raw.get("config")
-    if not isinstance(config, dict) or not config:
-        return []
-    return ["- **策略参数**：" + " ｜ ".join(f"{_e(k)}={_e(v)}" for k, v in config.items())]
-
-
-def _item_section(
-    item: DigestItem, extra: Iterable[str], tail: Iterable[str], ranking: Iterable[str] = ()
-) -> list[str]:
-    lines = [
-        f"### {ACTION_EMOJI[item.action]} {_e(item.name)}（{_e(item.key)}）· {ACTION_DISPLAY_LABEL[item.action]}"
+    stop_text = (
+        f"{stop.get('type') or '止损'} {format_price(stop.get('price'))}（距现价 {_pct(stop.get('distancePct'), False)}）"
+        if stop and stop.get("price") is not None
+        else DASH
+    )
+    fields = [
+        ("动作", ACTION_DISPLAY_LABEL[item.action]),
+        ("现价", price_text),
+        ("持仓", holding_text),
+        ("止损", stop_text),
+        ("依据", _basis(entry)),
+        ("最近交易", _trade_text(trades[-1] if trades else None)),
+        ("上一笔", _trade_text(trades[-2] if len(trades) > 1 else None)),
     ]
-    lines.extend(f"- {_e(line)}" for line in item.detail_lines)
-    lines.extend(f"- {line}" for line in extra)
-    ranking_lines = list(ranking)
-    if ranking_lines:
-        lines.append("")
-        lines.extend(ranking_lines)
-        lines.append("")
-    lines.extend(tail)
+    return [f"- **{k}**：{_e(v)}" for k, v in fields]
+
+
+def _rotation_detail(entry: Entry) -> list[str]:
+    raw, item = entry.raw, entry.item
+    holding = raw.get("currentHolding") or {}
+    next_signal = raw.get("nextSignal") or {}
+    rotations = [r for r in raw.get("rotations") or [] if isinstance(r, dict)]
+    holding_text = (
+        f"{_label(holding.get('symbol'), holding.get('name'))} ｜ 入场 {format_trade_date(holding.get('since'))}"
+        f" @{format_price(holding.get('entryPrice'))} ｜ 现价 {format_price(holding.get('currentPrice'))}"
+        f" ｜ 浮盈 {_pct(holding.get('unrealizedPnlPct'))}"
+        if holding
+        else "空仓"
+    )
+    target_text = (
+        f"{_short_name(next_signal.get('rotateFrom')) if next_signal.get('rotateFrom') else '空仓'}"
+        f" → {_short_name(next_signal.get('rotateTo')) if next_signal.get('rotateTo') else '空仓'}"
+    )
+    switches = [
+        f"{format_trade_date(r.get('entryDate'))} → {format_trade_date(r.get('exitDate'))} "
+        f"{_short_name(r.get('symbol'))}，{r.get('holdingDays', DASH)} 天，{_pct(r.get('periodReturnPct'))}"
+        for r in reversed(rotations[-RECENT_ROTATIONS_SHOWN:])
+    ]
+    fields = [
+        ("动作", ACTION_DISPLAY_LABEL[item.action]),
+        ("持仓", holding_text),
+        ("目标", target_text),
+        ("止损", "无（动量轮动不设止损位）"),
+        ("依据", _basis(entry)),
+        ("最近换仓", switches[0] if switches else DASH),
+        ("上一次", switches[1] if len(switches) > 1 else DASH),
+    ]
+    lines = [f"- **{k}**：{_e(v)}" for k, v in fields]
+    ranking = [r for r in raw.get("universeRanking") or [] if isinstance(r, dict)]
+    if ranking:
+        rows = [
+            [
+                r.get("rank", DASH),
+                ("✅ " if r.get("selected") else "") + _short_name(r.get("symbol"), r.get("name")),
+                DASH if r.get("momentum") is None else _num(r.get("momentum"), 4, True),
+                format_price(r.get("currentPrice")),
+                _num(r.get("targetWeight")),
+            ]
+            for r in ranking
+        ]
+        lines += ["", "**动量排名**（✅ 为目标持仓）", ""]
+        lines += _table(["#", "标的", "动量", "现价", "权重"], rows)
+    return lines
+
+
+# ---------- 各小节 ----------
+
+
+def _data_date(kind: str, raw: dict) -> str | None:
+    if kind == "rotation":
+        value = (raw.get("nextSignal") or {}).get("evaluatedAt")
+    else:
+        value = (raw.get("dateRange") or {}).get("end") or (raw.get("latestSignal") or {}).get(
+            "timestamp"
+        )
+    text = format_trade_date(value) if value else ""
+    return text if text and text != "暂无" else None
+
+
+def _conclusion(
+    entries: list[Entry], target_date: date, warnings: list[str], latest: str | None
+) -> list[str]:
+    if not entries:
+        return ["- ⚠️ 未取得任何当日数据，今日无法判断"]
+    lines: list[str] = []
+    trades = [e for e in entries if e.item.action in TRADE_ACTIONS]
+    for entry in trades:
+        item = entry.item
+        lines.append(
+            f"- {ACTION_EMOJI[item.action]} **{_e(item.name)}**（{_e(item.key)}）{ACTION_DISPLAY_LABEL[item.action]}："
+            f"{_e(_basis(entry))}"
+        )
+    if not trades:
+        hold = sum(1 for e in entries if e.item.action == "持有")
+        flat = len(entries) - hold
+        lines.append(f"- 今日无信号变化：持有 {hold} ｜ 空仓 {flat}")
+    stale = [e for e in entries if latest and e.data_date and e.data_date < latest]
+    missing = [e for e in entries if not e.data_date]
+    if stale or missing:
+        names = [f"{e.item.name}（{e.data_date}）" for e in stale] + [
+            f"{e.item.name}（日期缺失）" for e in missing
+        ]
+        lines.append(
+            f"- ⚠️ 数据截止日不一致，以 {latest or DASH} 为准；落后：{_e('、'.join(names))}"
+        )
+    elif latest:
+        try:
+            lag = (target_date - date.fromisoformat(latest)).days
+        except ValueError:
+            lag = 0
+        if lag > MAX_LAG_DAYS:
+            lines.append(f"- ⚠️ 数据整体落后：截止 {latest}，比报告日早 {lag} 天")
+    if warnings:
+        lines.append(f"- ⚠️ 有 {len(warnings)} 条数据提示，见「数据提示」")
+    return lines
+
+
+def _status_table(entries: list[Entry]) -> list[str]:
+    rows = []
+    for entry in entries:
+        snap = (
+            _rotation_snapshot(entry.raw)
+            if entry.kind == "rotation"
+            else _symbol_snapshot(entry.raw)
+        )
+        rows.append(
+            [
+                f"{entry.item.name}",
+                f"{ACTION_EMOJI[entry.item.action]} {ACTION_DISPLAY_LABEL[entry.item.action]}",
+                snap["position"],
+                snap["pnl"],
+                snap["stop"],
+                snap["switch"],
+            ]
+        )
+    return _table(["标的", "动作", "持仓", "浮盈", "止损位", "最近切换"], rows)
+
+
+def _perf_section(entries: list[Entry]) -> list[str]:
+    rows, annual, params = [], [], []
+    for entry in entries:
+        raw = entry.raw
+        summary = raw.get("summary") if isinstance(raw.get("summary"), dict) else {}
+
+        def pick(summary_key: str, metric_name: str) -> object:
+            value = summary.get(summary_key)
+            return value if value is not None else _metric_value(raw, metric_name)
+
+        drawdown = pick("maxDrawdown", "最大回撤")
+        current_dd = _metric_value(raw, "当前回撤")
+        rows.append(
+            [
+                entry.item.name,
+                _pct(pick("annualReturn", "年化收益率")),
+                _pct(-abs(float(drawdown))) if isinstance(drawdown, (int, float)) else DASH,
+                _pct(-abs(float(current_dd))) if isinstance(current_dd, (int, float)) else DASH,
+                _num(pick("sharpe", "夏普比率")),
+                _pct(_metric_value(raw, "胜率"), False),
+            ]
+        )
+        years = [y for y in raw.get("annualReturns") or [] if isinstance(y, dict) and "year" in y]
+        if years:
+            annual.append(
+                f"- {_e(entry.item.name)}："
+                + " ｜ ".join(f"{_e(y['year'])} {_pct(y.get('value'))}" for y in years)
+            )
+        config = raw.get("config")
+        if isinstance(config, dict) and config:
+            params.append(
+                f"- {_e(entry.item.name)}："
+                + " ｜ ".join(f"{_e(k)}={_e(v)}" for k, v in config.items())
+            )
+    lines = _table(["标的", "年化", "最大回撤", "当前回撤", "夏普", "胜率"], rows)
+    if annual:
+        lines += ["", "**年度收益**", ""] + annual
+    if params:
+        lines += ["", "**策略参数**", ""] + params
     return lines
 
 
@@ -256,56 +389,39 @@ def build_full_markdown(
     rotation_reports: list[dict] | None = None,
     warnings: Iterable[str] = (),
 ) -> str:
-    """完整日报 Markdown；没有任何数据时给出「无数据」说明与边界声明。"""
-    rotation_reports = rotation_reports or []
+    """完整日报 Markdown；没有任何数据时在「今日结论」里直说，并保留边界声明。"""
     date_str = target_date.isoformat()
-    entries: list[tuple[DigestItem, list[str]]] = []
+    entries: list[Entry] = []
     for record in reports:
-        raw = record.raw
-        item = build_symbol_item(record)
-        tail = _annual_line(raw) + _metric_lines(raw)
-        entries.append((item, _item_section(item, _symbol_extra_lines(raw), tail)))
-    for raw in rotation_reports:
-        item = build_rotation_item(raw, date_str)
-        tail = _summary_line(raw) + _annual_line(raw) + _metric_lines(raw) + _config_line(raw)
         entries.append(
-            (item, _item_section(item, _rotation_extra_lines(raw), tail, _ranking_lines(raw)))
+            Entry(build_symbol_item(record), "symbol", record.raw, _data_date("symbol", record.raw))
         )
-    entries.sort(key=lambda pair: (ACTION_PRIORITY.get(pair[0].action, 99), pair[0].key))
+    for raw in rotation_reports or []:
+        entries.append(
+            Entry(build_rotation_item(raw, date_str), "rotation", raw, _data_date("rotation", raw))
+        )
+    entries.sort(key=lambda e: (ACTION_PRIORITY.get(e.item.action, 99), e.item.key))
+    warning_list = [w for w in warnings if w]
+    dates = [e.data_date for e in entries if e.data_date]
+    latest = max(dates) if dates else None
 
-    lines = [f"# 📊 交易信号日报 · {date_str}"]
+    lines = [f"# 📊 交易信号日报 · {date_str}", ""]
+    lines.append(f"数据截止 {latest or DASH} ｜ 报告日 {date_str} ｜ 共 {len(entries)} 项")
+    lines += ["", "## 今日结论", ""] + _conclusion(entries, target_date, warning_list, latest)
+
     if entries:
-        counts = {
-            label: sum(1 for item, _ in entries if item.action == label)
-            for label in ACTION_PRIORITY
-        }
-        lines.append(
-            " ｜ ".join(
-                f"{ACTION_EMOJI[label]} {ACTION_DISPLAY_LABEL[label]} {counts[label]}"
-                for label in ACTION_PRIORITY
-            )
-        )
-        lines += ["", "## 🎯 信号总览"]
-        for item, _ in entries:
-            suffix = f" {_e(item.overview_suffix)}" if item.overview_suffix else ""
-            lines.append(
-                f"- {ACTION_EMOJI[item.action]} **{_e(item.name)}**（{_e(item.key)}）"
-                f"{ACTION_DISPLAY_LABEL[item.action]}{suffix}"
-            )
-        lines += ["", "---", "", "## 📌 详情"]
-        for index, (_, section) in enumerate(entries):
+        lines += ["", "## 状态总表", ""] + _status_table(entries)
+        lines += ["", "## 标的详情"]
+        for index, entry in enumerate(entries):
             if index:
                 lines += ["", "---"]
-            lines.append("")
-            lines.extend(section)
-    else:
-        lines += ["", "- 状态：无任何数据可用", "- 说明：未找到可用于汇总的当日 JSON 数据。"]
+            item = entry.item
+            lines += ["", f"**{ACTION_EMOJI[item.action]} {_e(item.name)}（{_e(item.key)}）**", ""]
+            lines += _rotation_detail(entry) if entry.kind == "rotation" else _symbol_detail(entry)
+        lines += ["", "## 回测与绩效", ""] + _perf_section(entries)
 
-    warning_list = [w for w in warnings if w]
     if warning_list:
-        lines += ["", "---", "", "## 🔎 数据提示"]
-        lines.extend(f"- {_e(w)}" for w in warning_list)
+        lines += ["", "## 数据提示", ""] + [f"- {_e(w)}" for w in warning_list]
 
-    lines += ["", "---", "", "## ⚠️ 边界声明"]
-    lines.extend(f"- {line}" for line in BOUNDARY_LINES)
+    lines += ["", "## 边界声明", ""] + [f"- {line}" for line in BOUNDARY_LINES]
     return "\n".join(lines) + "\n"

@@ -2,7 +2,7 @@
 
 - `md_escape`：把用户数据（标的名、原因文本等）写进 Markdown 前先转义，防止被解析成链接/图片/HTML/强调。
   Gotify 官方文档提醒：text/markdown 会自动下载 `![](url)` 图片，来源不可信的文本可被注入。
-- `markdown_to_html`：日报 Markdown 子集（# 标题、---、- 列表、1. 列表、> 引用、**粗体**、段落）→ 内联样式 HTML。
+- `markdown_to_html`：日报 Markdown 子集（# 标题、---、- 列表、1. 列表、> 引用、GFM 表格、**粗体**、段落）→ 内联样式 HTML。
   所有文本都经 `html.escape`，不允许原样输出 HTML；不支持图片与链接语法（按字面显示）。
 """
 
@@ -14,6 +14,7 @@ import re
 _MD_SPECIAL = set("\\`*_[]<~")
 _ESCAPABLE = set("\\`*_[]<>~!#()-.|&+{}")
 _ORDERED_RE = re.compile(r"^(\d+)\.\s+(.*)$")
+_TABLE_SEP_RE = re.compile(r"^:?-{3,}:?$")
 
 
 def md_escape(text: object) -> str:
@@ -53,11 +54,64 @@ STYLES = {
     "li": "margin:3px 0;",
     "hr": "border:0;border-top:1px solid #d0d7de;margin:16px 0;",
     "blockquote": "margin:8px 0;padding:4px 12px;border-left:3px solid #d0d7de;",
+    "table": "border-collapse:collapse;width:100%;font-size:14px;margin:8px 0;",
+    "th": "border:1px solid #d0d7de;padding:6px 8px;text-align:left;background:#f6f8fa;white-space:nowrap;",
+    "td": "border:1px solid #d0d7de;padding:6px 8px;text-align:left;vertical-align:top;",
 }
 
 
 def _tag(name: str, content: str) -> str:
     return f'<{name} style="{STYLES[name]}">{content}</{name}>'
+
+
+def _split_row(line: str) -> list[str]:
+    """按未转义的 | 切分表格行；`\\|` 保留给 _inline 还原成字面竖线。"""
+    text = line.strip()
+    if text.startswith("|"):
+        text = text[1:]
+    cells: list[str] = []
+    current: list[str] = []
+    terminated = False  # 最后一个字符是否为分隔用的 |
+    i = 0
+    while i < len(text):
+        terminated = False
+        if text[i] == "\\" and i + 1 < len(text) and text[i + 1] == "|":
+            current.append("\\|")
+            i += 2
+        elif text[i] == "|":
+            cells.append("".join(current).strip())
+            current = []
+            terminated = True
+            i += 1
+        else:
+            current.append(text[i])
+            i += 1
+    if not terminated:
+        cells.append("".join(current).strip())
+    return cells
+
+
+def _is_table_sep(line: str) -> bool:
+    cells = _split_row(line)
+    return bool(cells) and all(_TABLE_SEP_RE.match(c) for c in cells)
+
+
+def _render_table(rows: list[str]) -> str:
+    header = _split_row(rows[0])
+    head = "".join(f'<th class="c" style="{STYLES["th"]}">{_inline(c)}</th>' for c in header)
+    body = []
+    for row in rows[2:]:
+        cells = _split_row(row)
+        cells = (cells + [""] * len(header))[: len(header)]  # 列数对齐表头，多余丢弃、缺少补空
+        body.append(
+            "<tr>"
+            + "".join(f'<td class="c" style="{STYLES["td"]}">{_inline(c)}</td>' for c in cells)
+            + "</tr>"
+        )
+    return (
+        '<div style="overflow-x:auto;-webkit-overflow-scrolling:touch;">'
+        f'<table style="{STYLES["table"]}"><thead><tr>{head}</tr></thead><tbody>{"".join(body)}</tbody></table></div>'
+    )
 
 
 def markdown_to_html(markdown: str, title: str = "") -> str:
@@ -79,11 +133,23 @@ def markdown_to_html(markdown: str, title: str = "") -> str:
             items.clear()
             list_kind = None
 
-    for raw in markdown.splitlines():
-        line = raw.rstrip()
+    lines = [raw.rstrip() for raw in markdown.splitlines()]
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        index += 1
         stripped = line.strip()
         ordered = _ORDERED_RE.match(stripped)
-        if not stripped:
+        if stripped.startswith("|") and index < len(lines) and _is_table_sep(lines[index]):
+            flush_paragraph()
+            flush_list()
+            table_rows = [stripped, lines[index].strip()]
+            index += 1
+            while index < len(lines) and lines[index].strip().startswith("|"):
+                table_rows.append(lines[index].strip())
+                index += 1
+            blocks.append(_render_table(table_rows))
+        elif not stripped:
             flush_paragraph()
             flush_list()
         elif stripped == "---":
@@ -134,6 +200,8 @@ def markdown_to_html(markdown: str, title: str = "") -> str:
         "@media (prefers-color-scheme:dark){"
         "body,.wrap{background:#111418!important;color:#e6e8eb!important}"
         "hr{border-top-color:#3a4048!important}"
+        ".c{border-color:#3a4048!important}"
+        "th.c{background:#1c2128!important}"
         "blockquote{border-left-color:#3a4048!important}}"
         "</style></head>"
         '<body style="margin:0;padding:0;background:#ffffff;color:#1f2328;">'
