@@ -8,7 +8,7 @@ from pathlib import Path
 from urllib import error
 
 import pytest
-from test_digest_markdown import buy_report, hold_report, rotation_report
+from test_digest_markdown import assert_codes_named, buy_report, hold_report, rotation_report
 
 from trading.io import digest
 from trading.io.channels import Message, send_all
@@ -74,6 +74,10 @@ def check_structure(messages, budget):
                 assert re.match(r"^\|(---\|)+$", lines[top + 1]), (top, lines[top : top + 2])
             if line == "---":  # 分隔线前后留空行
                 assert i > 0 and lines[i - 1] == "" and lines[i + 1] == ""
+            if re.match(
+                r"^(🟢|🔄|🟡|🔴|⚪) \*\*.*\*\*|^\*\*(🟢|🔄|🟡|🔴|⚪) ", line
+            ):  # 标的标题行不能和它的字段行分家
+                assert i + 1 < len(lines) and lines[i + 1].startswith("- "), line
         assert not body.startswith("---") and not body.rstrip().endswith("---")
 
 
@@ -99,32 +103,43 @@ def test_eleven_items_split_into_messages_without_losing_content():
     joined = "\n".join(messages)
     missing = content_lines(render_full(parts)) - content_lines(joined)
     assert not missing, missing
+    for body in messages:
+        assert assert_codes_named(body) >= 0  # 每条消息里的代码前面都有名称
 
 
-def test_first_message_is_conclusion_plus_status_table_and_standalone():
+def test_first_message_is_conclusion_plus_status_overview_and_standalone():
     singles, rotations = eleven_items()
     messages = pack(make_parts(singles, rotations), BUDGET)
     first = messages[0]
     assert first.startswith("# 📊 交易信号日报")
-    assert "## 今日结论" in first and "## 状态总表" in first and "## 标的详情" not in first
-    assert first.count("\n| ") >= 11 + 1  # 11 行 + 表头
+    assert "## 今日结论" in first and "## 状态总览" in first and "## 标的详情" not in first
+    status = first[first.index("## 状态总览") :]
+    assert len(re.findall(r"^(?:🟢|🔄|🟡|🔴|⚪) \*\*", status, re.M)) == 11  # 11 个标的各一组
     assert all("## 今日结论" not in m for m in messages[1:])
+    assert not any("|---" in m for m in messages)  # iGotify 消息里没有任何表格语法
 
 
-def test_status_table_drops_least_important_columns_to_fit_first_message():
+def test_status_overview_drops_least_important_fields_to_fit_first_message():
     singles, rotations = eleven_items()
     parts = make_parts(singles, rotations)
-    full_first = byte_len(SEP_JOIN(parts))
-    tight = full_first - 200  # 比完整总表所需略小
-    messages = pack(parts, tight)
-    first = messages[0]
-    assert "## 状态总表" in first and "| 标的 | 动作 | 持仓 | 浮盈 | 止损位 |" in first
-    assert "最近切换" not in first and byte_len(first) <= tight
-
-
-def SEP_JOIN(parts):
-    """第 1 条在完整总表下的字节数。"""
-    return "\n\n".join(b.text for b in parts.summary)
+    full_first = byte_len("\n\n".join(b.text for b in parts.summary))
+    tight = full_first - 150  # 比完整总览所需略小
+    first = pack(parts, tight)[0]
+    status = first[first.index("## 状态总览") :]
+    assert "最近切换" not in status and "止损 1.111" in status and byte_len(first) <= tight
+    tighter = pack(parts, full_first - 600)[0]  # 再紧就只留名称与动作
+    status = tighter[tighter.index("## 状态总览") :]
+    assert "持仓" not in status and "止损" not in status and status.count("**（") == 0
+    assert (
+        len(re.findall(r"^(?:🟢|🔄|🟡) \*\*", status, re.M)) == 11
+        and byte_len(tighter) <= full_first - 600
+    )
+    spilled = pack(parts, full_first - 900)  # 总览放不下：留在第 2 条，第 1 条仍是独立可读的结论
+    assert (
+        "## 状态总览" not in spilled[0]
+        and "## 今日结论" in spilled[0]
+        and "## 状态总览" in spilled[1]
+    )
 
 
 def test_150_items_extreme_case_all_content_survives():
@@ -145,7 +160,7 @@ def test_150_items_extreme_case_all_content_survives():
     assert "极端标的149" in "\n".join(messages)
 
 
-def test_oversized_single_unit_is_split_by_rows_with_continuation_and_repeated_head():
+def test_oversized_single_unit_is_split_by_groups_with_continuation():
     rotation = copy.deepcopy(rotation_report())
     rotation["universeRanking"] = [
         {
@@ -164,9 +179,9 @@ def test_oversized_single_unit_is_split_by_rows_with_continuation_and_repeated_h
     check_structure(messages, BUDGET)
     joined = "\n".join(messages)
     assert joined.count("**（续）") >= 2 and "动量轮动" in joined
-    rank_rows = re.findall(r"^\| \d+ \| 候选\d{3} ", joined, re.M)
-    assert len(rank_rows) == 300  # 每行只出现一次，没丢没重
-    assert joined.count("| # | 标的 | 动量 | 现价 | 权重 |") >= 3  # 表头在每个续段重复
+    assert len(re.findall(r"^第\d+名 候选\d{3}（", joined, re.M)) == 300  # 每名只出现一次，没丢没重
+    assert len(re.findall(r"^- 动量 ", joined, re.M)) >= 300  # 每名的字段行都跟在名称行后面
+    assert_codes_named(joined)
 
 
 def test_single_line_longer_than_budget_is_hard_split_without_corrupting_utf8():
@@ -301,6 +316,7 @@ def test_segments_sent_in_order_with_interval_and_markdown_extras():
             and p["priority"] == 5
         )
         assert byte_len(p["title"]) + byte_len(p["message"]) <= 3000
+        assert "|---" not in p["message"] and assert_codes_named(p["message"]) >= 0
 
 
 def test_each_segment_retries_independently():

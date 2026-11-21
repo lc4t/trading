@@ -38,6 +38,9 @@ class Block:
     body_start: int = 0
     head: tuple[str, ...] = ()
     alternatives: tuple[tuple[str, ...], ...] = ()
+    grouped: bool = (
+        False  # True：body 里用空行隔开的若干行组（如一个标的的 2~3 行）整组切分，不拆开
+    )
 
     @property
     def text(self) -> str:
@@ -97,38 +100,70 @@ def _hard_split(line: str, limit: int) -> list[str]:
     return parts
 
 
+def _rows_of(block: Block) -> tuple[list[str], str]:
+    body = list(block.lines[block.body_start :])
+    if not block.grouped:
+        return body, "\n"
+    groups: list[list[str]] = [[]]
+    for line in body:
+        if line == "":
+            if groups[-1]:
+                groups.append([])
+        else:
+            groups[-1].append(line)
+    return ["\n".join(g) for g in groups if g], "\n\n"
+
+
+def _chunk_text(prefix: list[str], psep: str, rows: list[str], row_sep: str) -> str:
+    lead = "\n".join(prefix)
+    body = row_sep.join(rows)
+    if not rows:
+        return lead
+    return f"{lead}{psep}{body}" if prefix else body
+
+
 def _split_block(block: Block, room_first: int, room_rest: int) -> list[str]:
-    prefix, rows, head = (
-        list(block.lines[: block.body_start]),
-        block.lines[block.body_start :],
-        list(block.head),
-    )
+    prefix = list(block.lines[: block.body_start])
+    while prefix and prefix[-1] == "":
+        prefix.pop()
+    psep = "\n\n" if block.body_start and block.lines[block.body_start - 1] == "" else "\n"
+    rows, row_sep = _rows_of(block)
+    head = list(block.head)
+    hsep = "\n"
     chunks: list[str] = []
-    cur, base, room = list(prefix), len(prefix), room_first
+    cur_prefix, cur_psep, cur_rows, room = prefix, psep, [], room_first
+
+    def text(extra: list[str] | None = None) -> str:
+        return _chunk_text(cur_prefix, cur_psep, [*cur_rows, *(extra or [])], row_sep)
 
     def flush() -> None:
-        nonlocal cur, base, room
-        chunks.append("\n".join(cur))
-        cur, base, room = list(head), len(head), room_rest
+        nonlocal cur_prefix, cur_psep, cur_rows, room
+        chunks.append(text())
+        cur_prefix, cur_psep, cur_rows, room = head, hsep, [], room_rest
 
     for row in rows:
-        if byte_len("\n".join([*cur, row])) <= room:
-            cur.append(row)
+        if byte_len(text([row])) <= room:
+            cur_rows.append(row)
             continue
-        if len(cur) > base:
+        if cur_rows:
             flush()
-            if byte_len("\n".join([*cur, row])) <= room:
-                cur.append(row)
+            if byte_len(text([row])) <= room:
+                cur_rows.append(row)
                 continue
-        # 一行本身就放不下：按字符切（不会发生在正常日报里）
-        space = max(min(room_first, room_rest) - byte_len("\n".join(cur)) - 1, 50)
+        # 一行（或一组）本身就放不下：按字符切（不会发生在正常日报里）
+        space = max(
+            min(room_first, room_rest)
+            - byte_len(_chunk_text(cur_prefix, cur_psep, [], row_sep))
+            - 2,
+            50,
+        )
         pieces = _hard_split(row, space)
         for piece in pieces[:-1]:
-            cur.append(piece)
+            cur_rows.append(piece)
             flush()
-        cur.append(pieces[-1])
-    if len(cur) > base or not chunks:
-        chunks.append("\n".join(cur))
+        cur_rows.append(pieces[-1])
+    if cur_rows or not chunks:
+        chunks.append(text())
     return chunks
 
 
