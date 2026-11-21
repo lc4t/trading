@@ -33,6 +33,8 @@ class Message:
     title: str
     body: str
     subject: str  # 邮件主题；其它渠道用 title
+    markdown: str | None = None  # 完整版 Markdown：iGotify 的正文、邮件的纯文本版；None 时回退 body
+    html: str | None = None  # 邮件 HTML 版（由 markdown 转换）；None 则只发纯文本
 
 
 class _NoRedirect(request.HTTPRedirectHandler):

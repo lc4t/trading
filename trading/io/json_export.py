@@ -20,6 +20,22 @@ def get_stock_name(db_client: DBClient, symbol: str) -> str:
     return symbol
 
 
+def signal_extras(next_signal: dict) -> dict:
+    """latestSignal 的附加字段：止损位与触发条件（旧前端忽略未知字段，纯增量）。"""
+    extras: Dict[str, Any] = {}
+    stop = next_signal.get("stop_loss")
+    if isinstance(stop, dict) and stop.get("price") is not None:
+        extras["stopLoss"] = {
+            "type": stop.get("type"),
+            "price": round(float(stop["price"]), 3),
+            "distancePct": round(float(stop.get("distance_pct") or 0), 2),
+        }
+    conditions = [str(c) for c in next_signal.get("conditions") or [] if c]
+    if conditions:
+        extras["conditions"] = conditions
+    return extras
+
+
 def format_for_json(
     metrics: dict,
     trades: list,
@@ -58,6 +74,7 @@ def format_for_json(
             "asset": stock_name,
             "timestamp": latest_date,
             "prices": latest_prices,
+            **signal_extras(next_signal),
         },
         "positionInfo": next_signal.get("position_info"),
         "annualReturns": [

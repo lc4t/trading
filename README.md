@@ -92,8 +92,8 @@ PUSHGO_URL=https://gateway.pushgo.dev/push
 
 | 渠道 | 必填变量 | 可选变量 | 说明 |
 | --- | --- | --- | --- |
-| Resend（邮件） | `RESEND_API_KEY`、`RESEND_FROM`、`RESEND_TO` | — | `RESEND_TO` 多个收件人用逗号分隔；`RESEND_FROM` 必须是已在 Resend 验证过的域名/地址；调用 `POST https://api.resend.com/emails`，纯文本正文，主题含日期与有信号的标的名 |
-| iGotify（Gotify 协议） | `IGOTIFY_URL`、`IGOTIFY_TOKEN` | `IGOTIFY_PRIORITY`（默认 5）、`IGOTIFY_ALLOW_HTTP=1`（仅本地测试允许 http） | 调用 `POST {IGOTIFY_URL}/message`，令牌走请求头 `X-Gotify-Key`；`IGOTIFY_URL` 末尾斜杠会被规范化，默认只接受 https |
+| Resend（邮件） | `RESEND_API_KEY`、`RESEND_FROM`、`RESEND_TO` | — | `RESEND_TO` 多个收件人用逗号分隔；`RESEND_FROM` 必须是已在 Resend 验证过的域名/地址；调用 `POST https://api.resend.com/emails`，同时带 `html`（由同一份 Markdown 转换，内联样式、适配深色模式与手机宽度、数据全部转义）与 `text`（Markdown 原文）两个版本，主题含日期与有信号的标的名 |
+| iGotify（Gotify 协议） | `IGOTIFY_URL`、`IGOTIFY_TOKEN` | `IGOTIFY_PRIORITY`（默认 5）、`IGOTIFY_ALLOW_HTTP=1`（仅本地测试允许 http） | 调用 `POST {IGOTIFY_URL}/message`，令牌走请求头 `X-Gotify-Key`；`IGOTIFY_URL` 末尾斜杠会被规范化，默认只接受 https；正文是**完整版 Markdown**（`extras: {"client::display": {"contentType": "text/markdown"}}`），标题与优先级沿用日报标题和 `IGOTIFY_PRIORITY` |
 
 ```bash
 uv run python -m trading.cli.digest --data-dir frontend/data
@@ -115,6 +115,9 @@ uv run python -m trading.cli.digest --data-dir frontend/data
 - PushGo 沿用 `--max-retries` / `--retry-delay`；Resend 与 iGotify 固定 10 秒超时、最多重试 2 次（1s、2s 指数退避），只对网络错误、5xx、429 重试，其它 4xx 不重试
 - 至少一个渠道发送成功则命令返回 0；没有任何已配置渠道，或所有已配置渠道都失败时，命令非零退出
 - 日志不会出现令牌、完整 URL 查询串或邮箱地址
+- **PushGo 保持精简正文不变**；iGotify 与邮件使用完整版（`trading/io/digest_markdown.py`）：每个标的/策略的动作、持仓与浮盈、止损位与触发条件、最近交易/换仓（含原因）、轮动目标与各标的动量排名、回测概览与绩效指标、年度收益、策略参数、数据日期、边界声明，不做任何长度截断
+- 完整版只用标题、粗体、列表、分隔线（不用表格/图片/HTML）；来自数据的文本都会转义，避免被渲染成链接或图片。iGotify 经 APNs 推送，单条负载上限约 4KB，消息较长时通知预览可能被系统截断，全文在应用内查看（日志会提示，正文本身不会被截断）
+- 单标的 JSON 的 `latestSignal` 新增 `stopLoss`（类型/止损价/距现价%）与 `conditions`（触发条件）两个可选字段，供完整版日报使用；旧前端忽略未知字段
 
 ## 交互式 API（2.0 新增）
 

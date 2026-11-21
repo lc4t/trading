@@ -15,6 +15,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from ..io.channels import Message, send_all
+from ..io.channels.markup import markdown_to_html
 from ..io.digest import (
     build_digest,
     build_email_subject,
@@ -22,6 +23,7 @@ from ..io.digest import (
     load_rotation_reports,
     today_in_timezone,
 )
+from ..io.digest_markdown import build_full_markdown
 
 
 def parse_date(value: str) -> date:
@@ -90,10 +92,15 @@ def main() -> int:
         print(body)
         return 0
 
+    subject = build_email_subject(title, reports, target_date, rotation_reports)
+    # PushGo 沿用精简正文；iGotify 与邮件用完整版 Markdown（邮件另带由它转换的 HTML）
+    full_markdown = build_full_markdown(reports, target_date, rotation_reports, warnings)
     message = Message(
         title=title,
         body=body,
-        subject=build_email_subject(title, reports, target_date, rotation_reports),
+        subject=subject,
+        markdown=full_markdown,
+        html=markdown_to_html(full_markdown, subject),
     )
     result = send_all(
         message,
