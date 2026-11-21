@@ -1,4 +1,4 @@
-"""digest CLI：汇总当日交易信号（单标的 + 动量轮动）并推送到 PushGo。
+"""digest CLI：汇总当日交易信号（单标的 + 动量轮动）并推送到 PushGo / Resend 邮件 / iGotify。
 
 示例:
 
@@ -14,12 +14,12 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from ..io.channels import Message, send_all
 from ..io.digest import (
-    DEFAULT_PUSHGO_URL,
     build_digest,
+    build_email_subject,
     load_reports,
     load_rotation_reports,
-    send_pushgo_notification,
     today_in_timezone,
 )
 
@@ -32,7 +32,9 @@ def parse_date(value: str) -> date:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="汇总当日交易信号并推送到 PushGo")
+    parser = argparse.ArgumentParser(
+        description="汇总当日交易信号并推送到 PushGo / Resend 邮件 / iGotify（按环境变量自动启用）"
+    )
     parser.add_argument(
         "--data-dir",
         default="frontend/data",
@@ -88,29 +90,32 @@ def main() -> int:
         print(body)
         return 0
 
-    channel_id = os.getenv("PUSHGO_CHANNEL_ID", "").strip()
-    password = os.getenv("PUSHGO_PASSWORD", "").strip()
-    pushgo_url = args.pushgo_url or os.getenv("PUSHGO_URL", DEFAULT_PUSHGO_URL)
+    message = Message(
+        title=title,
+        body=body,
+        subject=build_email_subject(title, reports, target_date, rotation_reports),
+    )
+    result = send_all(
+        message,
+        os.environ,
+        pushgo_url=args.pushgo_url,
+        max_retries=args.max_retries,
+        retry_delay=args.retry_delay,
+    )
 
-    if not channel_id or not password:
-        print("[ERROR] 缺少 PUSHGO_CHANNEL_ID 或 PUSHGO_PASSWORD", file=sys.stderr)
-        return 1
-
-    try:
-        response = send_pushgo_notification(
-            title=title,
-            body=body,
-            channel_id=channel_id,
-            password=password,
-            pushgo_url=pushgo_url,
-            max_retries=args.max_retries,
-            retry_delay=args.retry_delay,
+    if not result.configured:
+        print(
+            "[ERROR] 没有任何已配置的通知渠道（PushGo / Resend / iGotify 的环境变量均不完整）",
+            file=sys.stderr,
         )
-    except RuntimeError as exc:
-        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+    if not result.ok:
+        print("[ERROR] 所有已配置的通知渠道都发送失败", file=sys.stderr)
         return 1
 
-    print(f"[INFO] PushGo 推送成功: {response.get('data', {}).get('message_id', 'unknown')}")
+    print(f"[INFO] 推送成功渠道: {', '.join(result.sent)}")
+    if result.failed:
+        print(f"[WARN] 失败渠道: {', '.join(name for name, _ in result.failed)}", file=sys.stderr)
     return 0
 
 

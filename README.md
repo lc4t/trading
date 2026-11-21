@@ -77,7 +77,7 @@ uv run python -m trading.cli.backtest 159915.SZ \
 
 ## 交易信号日报
 
-当 `data/*.json`（及 `data/rotation/*.json`）已生成后，运行独立汇总命令，把当天所有标的/策略的状态汇总后推送到 PushGo。
+当 `data/*.json`（及 `data/rotation/*.json`）已生成后，运行独立汇总命令，把当天所有标的/策略的状态汇总后推送到 PushGo、Resend 邮件、iGotify（按环境变量自动启用，可同时启用多个）。
 
 在 `.env` 中配置：
 
@@ -87,6 +87,13 @@ PUSHGO_PASSWORD=your-channel-password
 # 可选，默认使用官方网关
 PUSHGO_URL=https://gateway.pushgo.dev/push
 ```
+
+另外两个渠道，变量齐全才启用（缺任一变量时该渠道跳过并记一条「未配置」日志）：
+
+| 渠道 | 必填变量 | 可选变量 | 说明 |
+| --- | --- | --- | --- |
+| Resend（邮件） | `RESEND_API_KEY`、`RESEND_FROM`、`RESEND_TO` | — | `RESEND_TO` 多个收件人用逗号分隔；`RESEND_FROM` 必须是已在 Resend 验证过的域名/地址；调用 `POST https://api.resend.com/emails`，纯文本正文，主题含日期与有信号的标的名 |
+| iGotify（Gotify 协议） | `IGOTIFY_URL`、`IGOTIFY_TOKEN` | `IGOTIFY_PRIORITY`（默认 5）、`IGOTIFY_ALLOW_HTTP=1`（仅本地测试允许 http） | 调用 `POST {IGOTIFY_URL}/message`，令牌走请求头 `X-Gotify-Key`；`IGOTIFY_URL` 末尾斜杠会被规范化，默认只接受 https |
 
 ```bash
 uv run python -m trading.cli.digest --data-dir frontend/data
@@ -104,7 +111,10 @@ uv run python -m trading.cli.digest --data-dir frontend/data
 - 只汇总 `reportDate` 等于目标日期的 JSON（单标的在 `data-dir` 下，轮动策略在 `data-dir/rotation` 下）
 - 标题只统计 `买入`/`卖出`，`持有`/`观望` 仍会展示详情
 - 没有任何当天 JSON 时，会发送一条"无任何数据可用"的通知
-- PushGo 推送失败会按参数重试；超过重试次数后命令非零退出
+- 所有已配置渠道都会尝试发送，彼此独立：任一渠道失败只记录渠道名与脱敏后的原因，不影响其它渠道
+- PushGo 沿用 `--max-retries` / `--retry-delay`；Resend 与 iGotify 固定 10 秒超时、最多重试 2 次（1s、2s 指数退避），只对网络错误、5xx、429 重试，其它 4xx 不重试
+- 至少一个渠道发送成功则命令返回 0；没有任何已配置渠道，或所有已配置渠道都失败时，命令非零退出
+- 日志不会出现令牌、完整 URL 查询串或邮箱地址
 
 ## 交互式 API（2.0 新增）
 

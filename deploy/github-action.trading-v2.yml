@@ -93,7 +93,16 @@ jobs:
       # ---- 推送日报：daily_signal_digest.py 已经完整迁移进 trading.io.digest
       #      （含轮动信号汇总、列表符号/分隔线排版等），不再需要 ToolBox 的
       #      toolbox-dev 镜像，直接复用上面已经拉起来的 trading-2.0 ----
+      # 新增渠道（Resend 邮件 / iGotify）经步骤 env 传入、docker 用 `-e NAME` 继承：
+      # RESEND_FROM 可能含空格与尖括号（如 Name <a@b.com>），内联拼进命令行会被 shell 拆开。
+      # 任一渠道的变量不全时，该渠道自动跳过；PushGo / Resend / iGotify 至少一个成功即视为推送成功。
       - name: 推送日报（trading 镜像）
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          RESEND_FROM: ${{ secrets.RESEND_FROM }}
+          RESEND_TO: ${{ secrets.RESEND_TO }}
+          IGOTIFY_URL: ${{ secrets.IGOTIFY_URL }}
+          IGOTIFY_TOKEN: ${{ secrets.IGOTIFY_TOKEN }}
         run: |
           set -e
           docker run --rm \
@@ -102,6 +111,11 @@ jobs:
             -e PUSHGO_CHANNEL_ID=${{ secrets.PUSHGO_CHANNEL_ID }} \
             -e PUSHGO_PASSWORD=${{ secrets.PUSHGO_PASSWORD }} \
             -e PUSHGO_URL=${{ secrets.PUSHGO_URL }} \
+            -e RESEND_API_KEY \
+            -e RESEND_FROM \
+            -e RESEND_TO \
+            -e IGOTIFY_URL \
+            -e IGOTIFY_TOKEN \
             ghcr.io/lc4t/trading-2.0:latest \
             bash -c "
               cd /app && \

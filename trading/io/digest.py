@@ -512,6 +512,25 @@ def parse_trade_datetime(value: object) -> datetime:
     return datetime.min
 
 
+def build_email_subject(
+    title: str,
+    reports: list[ReportRecord],
+    target_date: date,
+    rotation_reports: list[dict] | None = None,
+    max_names: int = 3,
+) -> str:
+    """邮件主题：日报标题（含日期）+ 有交易信号的标的/策略名（最多 max_names 个）。"""
+    items = [build_symbol_item(record) for record in reports]
+    items.extend(build_rotation_item(raw, target_date.isoformat()) for raw in rotation_reports or [])
+    items.sort(key=lambda item: (ACTION_PRIORITY.get(item.action, 99), item.key))
+    names = [item.name for item in items if item.action in TRADE_ACTIONS]
+    if not names:
+        return title
+    shown = "、".join(names[:max_names])
+    more = f" 等{len(names)}个" if len(names) > max_names else ""
+    return f"{title} {shown}{more}"
+
+
 def send_pushgo_notification(
     title: str,
     body: str,
@@ -534,6 +553,14 @@ def send_pushgo_notification(
 
     last_error: Exception | None = None
 
+    def redact(text: object) -> str:
+        # 异常文本可能回显凭据，写日志/异常前先抹掉
+        result = str(text)
+        for secret in (password, channel_id):
+            if secret:
+                result = result.replace(secret, "***")
+        return result
+
     for attempt in range(1, max_retries + 1):
         req = request.Request(
             pushgo_url,
@@ -553,8 +580,11 @@ def send_pushgo_notification(
                 return parsed_body
         except (error.URLError, TimeoutError, json.JSONDecodeError, RuntimeError) as exc:
             last_error = exc
-            print(f"[WARN] PushGo 推送失败，第 {attempt}/{max_retries} 次: {exc}", file=sys.stderr)
+            print(
+                f"[WARN] PushGo 推送失败，第 {attempt}/{max_retries} 次: {redact(exc)}",
+                file=sys.stderr,
+            )
             if attempt < max_retries:
                 sleep_fn(retry_delay)
 
-    raise RuntimeError(f"PushGo 推送失败，已重试 {max_retries} 次: {last_error}")
+    raise RuntimeError(f"PushGo 推送失败，已重试 {max_retries} 次: {redact(last_error)}")
