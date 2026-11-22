@@ -61,6 +61,7 @@ class DigestParts:
     headline: str  # 例如 "换仓 1｜买入 1"，给第 1 条标题
     summary: tuple[Block, ...]
     units: tuple[Unit, ...]
+    keep_summary_together: bool = False  # True：摘要块一定整体放在第 1 条，宁可偏大也不拆到后面
 
 
 def render_full(parts: DigestParts) -> str:
@@ -216,6 +217,9 @@ def pack(parts: DigestParts, budget: int) -> list[str]:
     first: list[str] = []
     spill: tuple[Block, ...] = ()
     for index, block in enumerate(parts.summary):
+        if parts.keep_summary_together:
+            first.append(block.text)
+            continue
         for variant in (block.lines, *block.alternatives):
             text = "\n".join(variant)
             if byte_len(SEP.join([*first, text])) <= budget:
