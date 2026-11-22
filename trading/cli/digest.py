@@ -12,19 +12,20 @@ import os
 import sys
 from datetime import date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 
 from ..io.channels import Message, send_all
-from ..io.channels.markup import markdown_to_html
 from ..io.digest import (
+    DEFAULT_TIMEZONE,
     build_digest,
     build_email_subject,
     load_reports,
     load_rotation_reports,
     today_in_timezone,
 )
-from ..io.digest_markdown import build_full_markdown
+from ..io.digest_email import build_email
 from ..io.digest_push import build_push_parts
 
 
@@ -95,15 +96,23 @@ def main() -> int:
         return 0
 
     subject = build_email_subject(title, reports, target_date, rotation_reports)
-    # PushGo 沿用精简正文；邮件用完整版 Markdown（另带 HTML）；iGotify 用手机精简版（结论/总览/需关注分条发送）
-    full_markdown = build_full_markdown(reports, target_date, rotation_reports, warnings)
-    parts = build_push_parts(reports, target_date, rotation_reports, warnings)
+    # PushGo 沿用精简正文；iGotify 用手机精简版（分区卡片，默认一条）；邮件用同源但更全的 HTML + 文本
+    generated_at = datetime.now(ZoneInfo(DEFAULT_TIMEZONE)).strftime("%Y-%m-%d %H:%M")
+    email_configured = all(
+        os.getenv(k, "").strip() for k in ("RESEND_API_KEY", "RESEND_FROM", "RESEND_TO")
+    )
+    parts = build_push_parts(
+        reports, target_date, rotation_reports, warnings, generated_at, email_configured
+    )
+    full_markdown, html_doc = build_email(
+        reports, target_date, rotation_reports, warnings, generated_at, subject
+    )
     message = Message(
         title=title,
         body=body,
         subject=subject,
         markdown=full_markdown,
-        html=markdown_to_html(full_markdown, subject),
+        html=html_doc,
         parts=parts,
     )
     result = send_all(

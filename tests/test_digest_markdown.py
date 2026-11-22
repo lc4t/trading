@@ -545,5 +545,5 @@ def test_cli_dry_run_unchanged_and_main_builds_full_markdown(monkeypatch, capsys
         ):
             assert digest_cli.main() == 0
     message = sent["message"]
-    assert "止损位" in message.markdown and "<h1" in message.html
+    assert "持有状态" in message.markdown and "持有状态" in message.html
     assert "止损位" not in message.body  # PushGo 精简正文保持原样
