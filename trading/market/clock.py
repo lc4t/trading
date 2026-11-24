@@ -174,6 +174,15 @@ def completed_session_end(symbol: str, requested_end: dt.date, now: dt.datetime)
     return min(requested_end, latest)
 
 
+def latest_completed_date(symbol: str, now: dt.datetime | None = None) -> dt.date:
+    """标的所属市场「应有的最后一个已完成交易日」（读库统一的上界；``now`` 为 naive UTC，缺省取当前时刻）.
+
+    读库（回测、基准、JSON 的 dataEnd）只看不晚于它的行，不依赖行上的 ``is_final`` 标记：
+    日期晚于它的行要么是当天盘中半根，要么是未来日期，都不是完整日线。
+    """
+    return completed_session_end(symbol, dt.date.max, now if now is not None else utcnow())
+
+
 def wait_text(seconds: int) -> str:
     hours, rest = divmod(max(seconds, 0), 3600)
     minutes = rest // 60

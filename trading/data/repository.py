@@ -1,6 +1,6 @@
 import math
 import os
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Union
 
@@ -23,6 +23,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.sql import func, text
+
+from ..market.clock import latest_completed_date, utcnow
 
 # 加载环境变量
 load_dotenv()
@@ -386,7 +388,11 @@ class DBClient:
     #         return False
 
     def query_latest_by_symbol(self, symbol: str) -> Optional[Dict]:
-        """获取指定股票的最新交易日数据"""
+        """获取指定股票「已完成的」最新交易日数据.
+
+        只看不晚于该标的所属市场最后一个已完成交易日的行（不依赖行上的 is_final 标记）：
+        回测结束日、JSON 的 dateRange.end / 最新价都从这里来，白天不能读到当天盘中那一根。
+        """
         try:
             with self.Session() as session:
                 # 获取最新的一条记录
@@ -395,17 +401,20 @@ class DBClient:
                         """
                         SELECT date, open_price, close_price, high, low
                         FROM trading_data
-                        WHERE symbol = :symbol
+                        WHERE symbol = :symbol AND date <= :cap
                         ORDER BY date DESC
                         LIMIT 1
                     """
                     ),
-                    {"symbol": symbol},
+                    {"symbol": symbol, "cap": latest_completed_date(symbol, utcnow())},
                 ).fetchone()
 
                 if result:
+                    day = result[0]
+                    if isinstance(day, str):  # SQLite 的原生 SQL 返回字符串；MySQL 返回 date
+                        day = date.fromisoformat(day[:10])
                     return {
-                        "date": result[0],
+                        "date": day,
                         "open_price": float(result[1]),
                         "close_price": float(result[2]),
                         "high": float(result[3]),
