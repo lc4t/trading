@@ -7,6 +7,7 @@ HTML 学策引邮件的视觉结构：顶部日期条 → 黄色警示框（结�
 
 from __future__ import annotations
 
+import datetime as dt
 import html
 from dataclasses import replace
 from datetime import date
