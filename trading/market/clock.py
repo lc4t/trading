@@ -155,6 +155,25 @@ def awaiting_close(symbol: str, now: dt.datetime) -> dict | None:
     return {"date": day, "ready": ready}
 
 
+def completed_session_end(symbol: str, requested_end: dt.date, now: dt.datetime) -> dt.date:
+    """批量同步用的「只要已完成日线」的结束日：不晚于 ``requested_end``，也不晚于最近一个已定稿的交易日.
+
+    以标的所在市场的时区与收盘时间（沿用 ``final_ready_at``：收盘 + 缓冲）判断；``now`` 为 naive UTC：
+    - 工作日且已过「收盘 + 缓冲」→ 当天；
+    - 工作日但还没到 → 上一个工作日（当天盘中那一根不请求、不写入）；
+    - 周末 → 最近的周五。
+    只按周末判断交易日（没有节假日日历）。
+    """
+    today = market_today(symbol, now)
+    if today.weekday() >= 5:
+        latest = weekday_on_or_before(today)
+    elif now >= final_ready_at(symbol, today):
+        latest = today
+    else:
+        latest = prev_weekday(today)
+    return min(requested_end, latest)
+
+
 def wait_text(seconds: int) -> str:
     hours, rest = divmod(max(seconds, 0), 3600)
     minutes = rest // 60

@@ -11,7 +11,7 @@ import pytest
 from trading.data import fetcher as data_fetcher
 from trading.data.fetcher import FetchStatus
 
-from .conftest import FakeFetcher, make_row
+from .conftest import FakeFetcher, cn_time, make_row
 
 D = dt.date
 CORE = "159915.SZ"
@@ -35,7 +35,7 @@ def manager(monkeypatch, db_client):
     monkeypatch.setattr(data_fetcher, "DBClient", lambda: db_client)
     # 取数异常会触发 tenacity 重试（4~10 秒退避），测试里不真睡
     monkeypatch.setattr("tenacity.nap.time.sleep", lambda _s: None)
-    mgr = data_fetcher.StockDataManager()
+    mgr = data_fetcher.StockDataManager(now=lambda: cn_time(2024, 6, 6, 9, 0))  # 周四早晨：最近已完成的是 6/5
     mgr.market_fetcher = FakeFetcher()
     return mgr
 
@@ -75,7 +75,7 @@ def test_hang_seng_benchmark_is_recognised_too(manager):
 
 def test_non_core_symbol_can_be_declared_as_degradable(monkeypatch, db_client):
     monkeypatch.setattr(data_fetcher, "DBClient", lambda: db_client)
-    mgr = data_fetcher.StockDataManager(benchmark_symbols=["XYZ.SZ"])
+    mgr = data_fetcher.StockDataManager(benchmark_symbols=["XYZ.SZ"], now=lambda: cn_time(2024, 6, 6, 9, 0))
     mgr.market_fetcher = FakeFetcher()
     assert sync(mgr, "XYZ.SZ").status is FetchStatus.DEGRADED
     assert sync(mgr, BENCH).status is FetchStatus.FATAL  # 自定义集合替换默认集合
@@ -135,11 +135,11 @@ def test_persist_failure_is_fatal_even_for_a_benchmark(manager, monkeypatch):
     assert sync(manager, BENCH).status is FetchStatus.FATAL
 
 
-# ---------------------------------------------------------------- 复现线上：Yahoo 只给最近一根日线，end 不含当天
+# ---------------------------------------------------------------- 复现线上：Yahoo 只给最近一根日线
 class OneBarYahooTicker:
-    """复刻 2026-11 线上观察到的 000300.SS：不论 start 多早，上游只有「最近一根」日线."""
+    """复刻 2026-11 线上观察到的 000300.SS：不论 start 多早，上游只有「最近一根」日线（end 不含当日）."""
 
-    latest_bar = D(2024, 6, 5)  # 「今天」盘中的实时日线
+    latest_bar = D(2024, 6, 5)
 
     def __init__(self, symbol):
         self.symbol = symbol
@@ -147,33 +147,33 @@ class OneBarYahooTicker:
     def history(self, **kwargs):
         import pandas as pd
 
-        if not kwargs["start"] <= self.latest_bar < kwargs["end"]:  # end 不含当日
+        if not kwargs["start"] <= self.latest_bar < kwargs["end"]:
             return pd.DataFrame()
-        frame = pd.DataFrame(
+        return pd.DataFrame(
             [{"Open": 3900.0, "High": 3950.0, "Low": 3890.0, "Close": 3920.0, "Volume": 1,
               "Dividends": 0.0, "Stock Splits": 0.0}],
             index=pd.DatetimeIndex([pd.Timestamp(self.latest_bar)], tz="Asia/Shanghai"),
         )
-        return frame
 
 
-def test_real_yahoo_path_intraday_empty_is_degraded_then_next_day_recovers(
-    manager, store, monkeypatch
-):
+def test_real_yahoo_path_daytime_is_degraded_after_close_gets_the_bar(manager, store, monkeypatch):
     from trading.market.fetchers import RangePriceFetcher
 
-    monkeypatch.setattr("yfinance.Ticker", OneBarYahooTicker)
+    monkeypatch.setattr("yfinance.Ticker", OneBarYahooTicker)  # Yahoo 手里只有 6/5 这一根
     manager.market_fetcher = RangePriceFetcher()
     store.upsert([make_row(BENCH, D(2024, 6, 4), 3900.0)], price_basis="yahoo_adjusted", source="yahoo_auto_adjust")
 
-    # 盘中（结束日=当天）：上游空 → 降级沿用缓存，而不是失败
-    intraday = sync(manager, BENCH, end=D(2024, 6, 5))
-    assert intraday.status is FetchStatus.DEGRADED and "2024-06-04" in intraday.reason
+    # 6/5 白天（盘中）：结束日 = 6/4，Yahoo 手里只有当天盘中那一根 → 空 → 降级沿用 6/4 的缓存，且不写入 6/5
+    manager._now = lambda: cn_time(2024, 6, 5, 10, 0)
+    daytime = sync(manager, BENCH, end=D(2024, 6, 5))
+    assert daytime.status is FetchStatus.DEGRADED and "2024-06-04" in daytime.reason
+    assert store.query_range(BENCH, D(2024, 6, 5), D(2024, 6, 5)) == []
 
-    # 次日（结束日=下一个自然日）：同一根日线落进窗口 → 正常写入
-    OneBarYahooTicker.latest_bar = D(2024, 6, 5)
-    assert sync(manager, BENCH, end=D(2024, 6, 6)).status is FetchStatus.OK
-    assert [r["date"] for r in store.query_range(BENCH, D(2024, 6, 5), D(2024, 6, 5))] == [D(2024, 6, 5)]
+    # 收盘 + 缓冲之后：结束日 = 6/5，那一根已是完整日线 → 正常写入，且标为定稿
+    manager._now = lambda: cn_time(2024, 6, 5, 16, 0)
+    assert sync(manager, BENCH, end=D(2024, 6, 5)).status is FetchStatus.OK
+    row = store.query_range(BENCH, D(2024, 6, 5), D(2024, 6, 5))[0]
+    assert row["meta"]["is_final"] is True
 
 
 # ---------------------------------------------------------------- CLI 退出码
