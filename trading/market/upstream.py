@@ -28,6 +28,7 @@ from .fetchers import (
     BACKUP_SINA,
     BACKUP_TENCENT,
     is_china_exchange_symbol,
+    is_tencent_primary_index,
 )
 
 SOURCE_YAHOO = "yahoo"
@@ -68,6 +69,8 @@ DEFAULT_POLICIES: Dict[str, UpstreamPolicy] = {
 def source_for(symbol: str, mode: str = "raw") -> str:
     if is_off_market_fund(symbol):
         return SOURCE_EASTMONEY_FUND
+    if is_tencent_primary_index(symbol):
+        return SOURCE_TENCENT  # 沪深300：腾讯主源（失败回退东财），不再走 Yahoo
     if is_china_exchange_symbol(symbol):
         return SOURCE_THS if mode == "legacy" else SOURCE_EASTMONEY
     return SOURCE_YAHOO

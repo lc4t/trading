@@ -135,47 +135,6 @@ def test_persist_failure_is_fatal_even_for_a_benchmark(manager, monkeypatch):
     assert sync(manager, BENCH).status is FetchStatus.FATAL
 
 
-# ---------------------------------------------------------------- 复现线上：Yahoo 只给最近一根日线
-class OneBarYahooTicker:
-    """复刻 2026-11 线上观察到的 000300.SS：不论 start 多早，上游只有「最近一根」日线（end 不含当日）."""
-
-    latest_bar = D(2024, 6, 5)
-
-    def __init__(self, symbol):
-        self.symbol = symbol
-
-    def history(self, **kwargs):
-        import pandas as pd
-
-        if not kwargs["start"] <= self.latest_bar < kwargs["end"]:
-            return pd.DataFrame()
-        return pd.DataFrame(
-            [{"Open": 3900.0, "High": 3950.0, "Low": 3890.0, "Close": 3920.0, "Volume": 1,
-              "Dividends": 0.0, "Stock Splits": 0.0}],
-            index=pd.DatetimeIndex([pd.Timestamp(self.latest_bar)], tz="Asia/Shanghai"),
-        )
-
-
-def test_real_yahoo_path_daytime_is_degraded_after_close_gets_the_bar(manager, store, monkeypatch):
-    from trading.market.fetchers import RangePriceFetcher
-
-    monkeypatch.setattr("yfinance.Ticker", OneBarYahooTicker)  # Yahoo 手里只有 6/5 这一根
-    manager.market_fetcher = RangePriceFetcher()
-    store.upsert([make_row(BENCH, D(2024, 6, 4), 3900.0)], price_basis="yahoo_adjusted", source="yahoo_auto_adjust")
-
-    # 6/5 白天（盘中）：结束日 = 6/4，Yahoo 手里只有当天盘中那一根 → 空 → 降级沿用 6/4 的缓存，且不写入 6/5
-    manager._now = lambda: cn_time(2024, 6, 5, 10, 0)
-    daytime = sync(manager, BENCH, end=D(2024, 6, 5))
-    assert daytime.status is FetchStatus.DEGRADED and "2024-06-04" in daytime.reason
-    assert store.query_range(BENCH, D(2024, 6, 5), D(2024, 6, 5)) == []
-
-    # 收盘 + 缓冲之后：结束日 = 6/5，那一根已是完整日线 → 正常写入，且标为定稿
-    manager._now = lambda: cn_time(2024, 6, 5, 16, 0)
-    assert sync(manager, BENCH, end=D(2024, 6, 5)).status is FetchStatus.OK
-    row = store.query_range(BENCH, D(2024, 6, 5), D(2024, 6, 5))[0]
-    assert row["meta"]["is_final"] is True
-
-
 # ---------------------------------------------------------------- CLI 退出码
 def run_main(monkeypatch, *extra):
     monkeypatch.setattr(

@@ -45,6 +45,13 @@ BACKUP_HEADERS = {
     "Accept-Encoding": "identity",
 }
 EASTMONEY_BACKUP_UT = "fa5fd1943c7b386f172d6893dbfba10b"
+EASTMONEY_KLINE_UT = "7eea3edcaed734bea9cbfc24409ed989"  # 东财公开 K 线接口的通用 ut（非账号凭据）
+TENCENT_INDEX_MAX_COUNT = 2000  # 腾讯 fqkline 单次最多 2000 根（3000 会 param error），长区间按窗口分段
+TENCENT_INDEX_WINDOW_DAYS = 2000  # 每段覆盖的自然日数（约 1400 根），保证落在上限内
+
+# 指数源标识（FetchResult.source，也写入 market_data_meta.source）
+INDEX_TENCENT = "tencent_index"
+INDEX_EASTMONEY = "eastmoney_index"
 
 # 备用源标识 → 它写入的价格口径
 BACKUP_EASTMONEY = "eastmoney_fqt0"
@@ -80,6 +87,34 @@ BACKUP_MAX_ATTEMPTS = 2
 BACKUP_RETRY = RetryPolicy(
     attempts=BACKUP_MAX_ATTEMPTS, delay=lambda n: 0.4 + 0.4 * random.random(), stop_on_rate_limit=True
 )
+# 指数源：腾讯 3 次（间隔约 1s）；东财 push2his 对指数日线会间歇 RemoteDisconnected（runner 实测单次成功率
+# 约 17%~60%），所以单独给 6 次、每次间隔 2~5 秒。**不要**用 SYNC_RETRY（30+60n 秒的长睡眠会拖垮夜间任务）。
+TENCENT_INDEX_RETRY = RetryPolicy(
+    attempts=3, delay=lambda n: 0.8 + 0.4 * random.random(), stop_on_rate_limit=True
+)
+EASTMONEY_INDEX_RETRY = RetryPolicy(
+    attempts=6, delay=lambda n: 2.0 + 3.0 * random.random(), stop_on_rate_limit=True
+)
+
+
+@dataclass(frozen=True)
+class IndexRoute:
+    tencent: str  # 腾讯 fqkline 代码
+    eastmoney: Optional[str]  # 东财 secid；None = 不依赖东财（^HSI 在 runner 上只成功约 2/12）
+    yahoo_primary: bool  # True：Yahoo 仍是主源，腾讯作备源；False：腾讯主源，东财备源，不用 Yahoo
+
+
+# Yahoo 对 000300.SS 只给最近一根日线，不能做历史源；^HSI 的 Yahoo 历史完整，保持主源
+INDEX_ROUTES: Dict[str, IndexRoute] = {
+    "000300.SS": IndexRoute("sh000300", "1.000300", False),
+    "000300.SH": IndexRoute("sh000300", "1.000300", False),
+    "^HSI": IndexRoute("hkHSI", None, True),
+}
+
+
+def is_tencent_primary_index(symbol: str) -> bool:
+    route = INDEX_ROUTES.get(symbol)
+    return route is not None and not route.yahoo_primary
 
 
 @dataclass
@@ -133,6 +168,10 @@ def upstream_route_for_symbol(symbol: str, mode: str = "raw") -> str:
         return "backup_unadjusted_market_price"
     if mode == QFQ_TENCENT:
         return "backup_tencent_qfq_market_price"
+    if is_tencent_primary_index(symbol):
+        return "tencent_index_with_eastmoney_fallback"
+    if symbol in INDEX_ROUTES:
+        return "yahoo_index_with_tencent_fallback"
     if is_off_market_fund(symbol):
         return "eastmoney_off_market_fund_nav_with_trend_fallback"
     if is_china_exchange_symbol(symbol):
@@ -183,6 +222,8 @@ class RangePriceFetcher:
         retry: Optional[RetryPolicy] = None,
     ) -> FetchResult:
         retry = retry or self.retry
+        if symbol in INDEX_ROUTES:
+            return self.fetch_index(symbol, start, end, mode=mode, retry=retry)
         if is_off_market_fund(symbol):
             return self.fetch_fund_nav(symbol, start, end, retry)
         if is_china_exchange_symbol(symbol):
@@ -202,7 +243,7 @@ class RangePriceFetcher:
         params = {
             "fields1": "f1,f2,f3,f4,f5,f6",
             "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
-            "ut": "7eea3edcaed734bea9cbfc24409ed989",
+            "ut": EASTMONEY_KLINE_UT,
             "klt": "101",
             "fqt": str(fqt),
             "secid": f"{market}.{code}",
@@ -356,6 +397,155 @@ class RangePriceFetcher:
             raise FetchError(
                 f"Eastmoney fund NAV primary and fallback failed ({type(exc).__name__})"
             ) from exc
+
+    # ------------------------------------------------------------------ 指数（沪深300 / 恒指）
+    def fetch_index(
+        self,
+        symbol: str,
+        start: date,
+        end: date,
+        *,
+        mode: str = "raw",
+        retry: Optional[RetryPolicy] = None,
+        sources: Optional[List[str]] = None,
+    ) -> FetchResult:
+        """指数日线的取数顺序（任一源失败 / 返回空就换下一个）：
+
+        - 000300.SS / 000300.SH：腾讯 → 东财（Yahoo 只给最近一根，不用）；
+        - ^HSI：Yahoo（主源，沿用调用方的重试策略）→ 腾讯 hkHSI；东财 ^HSI 不依赖。
+
+        ``sources`` 可显式指定（回补脚本只用腾讯 / 东财取交易日列表）。全部失败时抛 FetchError
+        （全是限流时抛 RateLimited）；全部成功但都为空则返回空结果，由调用方按缓存降级。
+        返回的行只含 ``start..end``（调用方保证 ``end`` 不晚于最近一个已收盘的交易日，腾讯带出的当天盘中行会被裁掉）。
+        """
+        route = INDEX_ROUTES[symbol]
+        chain = sources or (["yahoo", INDEX_TENCENT] if route.yahoo_primary else [INDEX_TENCENT, INDEX_EASTMONEY])
+        errors: List[str] = []
+        limited: Optional[RateLimited] = None
+        last_empty: Optional[FetchResult] = None
+        for source in chain:
+            try:
+                if source == "yahoo":
+                    result = self.fetch_yahoo(
+                        symbol, start, end, retry=retry or self.retry, legacy=(mode == "legacy")
+                    )
+                elif source == INDEX_TENCENT:
+                    result = self.fetch_index_tencent(symbol, start, end, TENCENT_INDEX_RETRY)
+                elif source == INDEX_EASTMONEY:
+                    result = self.fetch_index_eastmoney(symbol, start, end, EASTMONEY_INDEX_RETRY)
+                else:  # pragma: no cover
+                    raise FetchError(f"unknown index source {source}")
+            except RateLimited as exc:
+                limited = exc
+                errors.append(f"{source}=rate_limited")
+                logger.warning(f"{symbol} 指数源 {source} 限流，换下一个源")
+                continue
+            except FetchError as exc:
+                errors.append(f"{source}={exc}")
+                logger.warning(f"{symbol} 指数源 {source} 失败（{exc}），换下一个源")
+                continue
+            if result.rows:
+                if errors:
+                    logger.info(f"{symbol} 使用备用指数源 {result.source}（前序失败：{'; '.join(errors)}）")
+                return result
+            errors.append(f"{source}=empty")
+            last_empty = result
+            logger.warning(f"{symbol} 指数源 {source} 返回空，换下一个源")
+        if last_empty is not None:
+            # 至少一个源正常应答但没有数据（例如请求窗口内没有交易日）：交给调用方按缓存降级，而不是当成取数失败
+            return last_empty
+        if limited is not None and all(e.endswith("=rate_limited") for e in errors):
+            raise limited
+        raise FetchError("all index sources failed: " + "; ".join(errors))
+
+    def fetch_index_tencent(
+        self, symbol: str, start: date, end: date, retry: RetryPolicy = TENCENT_INDEX_RETRY
+    ) -> FetchResult:
+        """腾讯指数日线（不复权）。每次请求最多 2000 根，长区间按自然日窗口分段取."""
+        import requests
+
+        code = INDEX_ROUTES[symbol].tencent
+        rows: Dict[date, Dict[str, Any]] = {}
+        window_end = end
+        while window_end >= start:
+            window_start = max(start, window_end - timedelta(days=TENCENT_INDEX_WINDOW_DAYS - 1))
+            params = {"param": f"{code},day,{window_start:%Y-%m-%d},{window_end:%Y-%m-%d},{TENCENT_INDEX_MAX_COUNT},"}
+            try:
+                response = _request_with_retry(
+                    requests.get,
+                    testing_upstream.endpoint(TENCENT_KLINE_URL.format(kind="fqkline"), "/tencent/index"),
+                    retry,
+                    params=params,
+                    headers=BACKUP_HEADERS,
+                    timeout=15,
+                )
+                payload = response.json()
+            except RateLimited:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                raise _backup_error(INDEX_TENCENT, retry, exc) from exc
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if not isinstance(data, dict):  # 参数非法时 data 是 []
+                raise FetchError(f"{INDEX_TENCENT} rejected the request ({str(payload)[:80]})")
+            items = (data.get(code) or {}).get("day") or []
+            for item in items:  # [日期, 开, 收, 高, 低, 量]
+                try:
+                    day = date.fromisoformat(item[0])
+                    if start <= day <= end:
+                        rows[day] = _backup_row(symbol, day, item[1], item[3], item[4], item[2], item[5], None)
+                except (ValueError, TypeError, IndexError) as exc:
+                    raise FetchError(f"{INDEX_TENCENT} returned an unparsable row") from exc
+            window_end = window_start - timedelta(days=1)
+        return FetchResult([rows[d] for d in sorted(rows)], INDEX_TENCENT, "raw")
+
+    def fetch_index_eastmoney(
+        self, symbol: str, start: date, end: date, retry: RetryPolicy = EASTMONEY_INDEX_RETRY
+    ) -> FetchResult:
+        """东财指数日线（fqt=0）。断连时按 ``retry`` 短间隔重试；没有东财 secid 的指数直接报错."""
+        import requests
+
+        secid = INDEX_ROUTES[symbol].eastmoney
+        if secid is None:
+            raise FetchError(f"{INDEX_EASTMONEY} is not configured for {symbol}")
+        params = {
+            "fields1": "f1,f2,f3,f4,f5,f6",
+            "fields2": "f51,f52,f53,f54,f55,f56,f57",
+            "ut": EASTMONEY_KLINE_UT,
+            "klt": "101",
+            "fqt": "0",
+            "secid": secid,
+            "beg": start.strftime("%Y%m%d"),
+            "end": end.strftime("%Y%m%d"),
+        }
+        try:
+            response = _request_with_retry(
+                requests.get,
+                testing_upstream.endpoint(EASTMONEY_URL, "/eastmoney/kline"),
+                retry,
+                params=params,
+                headers=BACKUP_HEADERS,
+                timeout=15,
+            )
+            lines = (response.json().get("data") or {}).get("klines") or []
+        except RateLimited:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise _backup_error(INDEX_EASTMONEY, retry, exc) from exc
+        rows: List[Dict[str, Any]] = []
+        for line in lines:  # f51..f57：日期,开,收,高,低,量,额
+            fields = line.split(",")
+            if len(fields) < 6:
+                continue
+            try:
+                day = date.fromisoformat(fields[0])
+                if start <= day <= end:
+                    rows.append(
+                        _backup_row(symbol, day, fields[1], fields[3], fields[4], fields[2], fields[5],
+                                    _number(fields[6]) if len(fields) > 6 else None)
+                    )
+            except (ValueError, TypeError) as exc:
+                raise FetchError(f"{INDEX_EASTMONEY} returned an unparsable row") from exc
+        return FetchResult(rows, INDEX_EASTMONEY, "raw")
 
     # -------------------------------------------------------------------- ths
     def fetch_ths_etf(self, symbol: str) -> FetchResult:

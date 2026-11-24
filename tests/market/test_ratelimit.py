@@ -36,7 +36,8 @@ def make_guard(clock, sleeps=None, store=None, **kw):
 
 # ------------------------------------------------------------------- guard
 def test_source_routing():
-    assert source_for("AAPL") == "yahoo" and source_for("0700.HK") == "yahoo" and source_for("000300.SS") == "yahoo"
+    assert source_for("AAPL") == "yahoo" and source_for("0700.HK") == "yahoo" and source_for("^HSI") == "yahoo"
+    assert source_for("000300.SS") == "tencent" and source_for("000300.SH") == "tencent"  # 沪深300 腾讯主源
     assert source_for("159915.SZ") == "eastmoney" and source_for("159915.SZ", "legacy") == "ths"
     assert source_for("005698") == "eastmoney_fund"
 
