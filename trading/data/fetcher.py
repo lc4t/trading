@@ -1,5 +1,7 @@
-from datetime import datetime, timedelta
-from typing import List, Optional, Any, Dict, Union
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from enum import Enum
+from typing import Iterable, List, Optional, Any, Dict, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from argparse import ArgumentParser
 from abc import ABC, abstractmethod
@@ -18,6 +20,32 @@ import pandas as pd
 import sys
 import time
 from sqlalchemy.exc import SQLAlchemyError
+
+# 基准（只用于算 Beta 等参考指标，不参与交易信号）。取不到新数据时只降级，不拖垮整条链路。
+BENCHMARK_SYMBOLS = frozenset({"000300.SS", "000300.SH", "^HSI"})
+# 最新数据距请求结束日超过这么多个交易日，就认为「不够新」：核心标的视为致命，基准仅告警
+MAX_STALE_TRADING_DAYS = 2
+
+
+class FetchStatus(str, Enum):
+    OK = "ok"  # 拿到足够新的数据并写库
+    DEGRADED = "degraded"  # 没拿到新数据（或不够新），但可降级继续：缓存可用，或只是基准
+    FATAL = "fatal"  # 核心交易标的没有可用数据，或写库失败
+
+
+@dataclass(frozen=True)
+class FetchOutcome:
+    symbol: str
+    status: FetchStatus
+    reason: str = ""
+
+    @property
+    def fatal(self) -> bool:
+        return self.status is FetchStatus.FATAL
+
+
+def _as_date(value: Any) -> date:
+    return value.date() if isinstance(value, datetime) else value
 
 
 class DataFetcher(ABC):
@@ -76,7 +104,15 @@ class ADataFetcher(DataFetcher):
 
 
 class StockDataManager:
-    def __init__(self, max_workers: int = 1, max_retries: int = 5):
+    def __init__(
+        self,
+        max_workers: int = 1,
+        max_retries: int = 5,
+        benchmark_symbols: Optional[Iterable[str]] = None,
+    ):
+        self.benchmark_symbols = frozenset(
+            BENCHMARK_SYMBOLS if benchmark_symbols is None else benchmark_symbols
+        )
         self.db_client = DBClient()
         self.max_workers = max_workers
         self.max_retries = max_retries
@@ -181,52 +217,103 @@ class StockDataManager:
             corporate.commit(self.market_store, symbol, self._pending_actions.pop(symbol, []), utcnow())
         return written > 0
 
-    def fetch_data(
+    def _cached_latest_date(self, symbol: str) -> Optional[date]:
+        """数据库里该标的最新一行的日期；读失败按「没有缓存」处理."""
+        try:
+            row = self.market_store.query_latest(symbol)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"读取 {symbol} 的缓存数据失败：{e}")
+            return None
+        return _as_date(row["date"]) if row else None
+
+    def _classify(
+        self,
+        symbol: str,
+        end_date: Any,
+        *,
+        fetch_failed: bool,
+        stale_days: int,
+        persist_failed: bool,
+        detail: str,
+    ) -> FetchOutcome:
+        """把一次同步的结果归为 OK / DEGRADED / FATAL.
+
+        - 写库失败：一律致命（库不可写，后面的信号也不可信）。
+        - 取到数据且够新：OK。
+        - 取不到（空或抛错）：缓存够新则沿用缓存（可降级）；缓存缺失/过旧时，基准降级、核心标的致命。
+        - 取到了但不够新：基准降级，核心标的致命（与此前行为一致）。
+        """
+        is_benchmark = symbol in self.benchmark_symbols
+        if persist_failed:
+            return FetchOutcome(symbol, FetchStatus.FATAL, detail or "写库失败")
+        if not fetch_failed and stale_days <= MAX_STALE_TRADING_DAYS:
+            return FetchOutcome(symbol, FetchStatus.OK)
+
+        if fetch_failed:
+            cached = self._cached_latest_date(symbol)
+            end_day = _as_date(end_date)
+            cached_age = self.count_trading_days(cached, end_day) if cached else None
+            if cached is not None and cached_age <= MAX_STALE_TRADING_DAYS:
+                reason = (
+                    f"{symbol} 本次未取到新数据（{detail}），沿用数据库缓存，最新日期 {cached}"
+                    f"（距 {end_day} 约 {cached_age} 个交易日）"
+                )
+                return FetchOutcome(symbol, FetchStatus.DEGRADED, reason)
+            have = f"缓存最新日期 {cached} 已过旧" if cached else "数据库也没有缓存"
+            reason = f"{symbol} 没有可用的新数据（{detail}；{have}）"
+        else:
+            reason = f"{symbol} 数据过旧（距请求结束日 {stale_days} 个交易日）"
+
+        if is_benchmark:
+            return FetchOutcome(
+                symbol, FetchStatus.DEGRADED, f"{reason}；{symbol} 仅作基准，继续后续流程（相关指标可能缺失或滞后）"
+            )
+        return FetchOutcome(symbol, FetchStatus.FATAL, reason)
+
+    def sync_symbol(
         self,
         symbol: str,
         start_date: Optional[datetime] = None,
         end_date: Optional[datetime] = None,
         db_client: Optional[DBClient] = None,
-    ) -> bool:
-        """获取股票数据"""
+    ) -> FetchOutcome:
+        """同步单个标的并给出分级结果（OK / DEGRADED / FATAL）。"""
         if db_client is None:
             db_client = DBClient()
 
+        fetch_failed = False
+        persist_failed = False
+        stale_days = 0
+        detail = ""
         try:
-            # 准备任务列表
-            tasks = []
-            for sym in [symbol]:
-                sym_start_date = start_date
-                if not sym_start_date:
-                    # 优先使用 listing_date
-                    symbol_info = db_client.get_symbol_info(sym)
-                    if symbol_info and symbol_info.get("listing_date"):
-                        sym_start_date = symbol_info["listing_date"]
-                    else:
-                        # 如果没有 listing_date，则使用最新数据日期
-                        latest_date = db_client.get_latest_date(sym)
-                        sym_start_date = (
-                            (latest_date + timedelta(days=1))
-                            if latest_date
-                            else (end_date - timedelta(days=30))
-                        )
-                        logger.warning(
-                            f"未找到 {sym} 的上市日期，使用 {sym_start_date} 作为起始日期"
-                        )
-
-                tasks.append((sym, sym_start_date, end_date))
+            sym_start_date = start_date
+            if not sym_start_date:
+                # 优先使用 listing_date
+                symbol_info = db_client.get_symbol_info(symbol)
+                if symbol_info and symbol_info.get("listing_date"):
+                    sym_start_date = symbol_info["listing_date"]
+                else:
+                    # 如果没有 listing_date，则使用最新数据日期
+                    latest_date = db_client.get_latest_date(symbol)
+                    sym_start_date = (
+                        (latest_date + timedelta(days=1))
+                        if latest_date
+                        else (end_date - timedelta(days=30))
+                    )
+                    logger.warning(
+                        f"未找到 {symbol} 的上市日期，使用 {sym_start_date} 作为起始日期"
+                    )
 
             # 使用线程池并发获取数据
-            success = True
             with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 futures = {
-                    executor.submit(self._fetch_single_stock_data, sym, start, end): sym
-                    for sym, start, end in tasks
+                    executor.submit(
+                        self._fetch_single_stock_data, symbol, sym_start_date, end_date
+                    ): symbol
                 }
 
-                with tqdm(total=len(tasks), desc="Fetching data") as pbar:
+                with tqdm(total=len(futures), desc="Fetching data") as pbar:
                     for future in as_completed(futures):
-                        symbol = futures[future]
                         try:
                             data = future.result()
                             if data:
@@ -249,9 +336,9 @@ class StockDataManager:
                                 natural_days_diff = (end_date - latest_data_date).days
                                 trading_days_diff = self.count_trading_days(latest_data_date, end_date)
 
-                                if trading_days_diff > 2:
-                                    # 如果数据延迟超过2个交易日，视为失败
-                                    success = False
+                                if trading_days_diff > MAX_STALE_TRADING_DAYS:
+                                    # 数据延迟超过 2 个交易日，视为不够新
+                                    stale_days = trading_days_diff
                                     logger.error(
                                         f"{symbol} 数据过旧：最新数据日期为 {latest_data_date}，"
                                         f"距离请求的结束日期 {end_date} 已有 {trading_days_diff} 个交易日"
@@ -267,21 +354,43 @@ class StockDataManager:
                                     )
 
                                 if not self._persist(symbol, data):
-                                    success = False
+                                    persist_failed = True
+                                    detail = "写库失败"
                                     logger.error(f"Failed to save data for {symbol}")
                             else:
-                                success = False
+                                # 盘中请求「到今天」时上游常常还没有当日数据，这里不直接判失败，
+                                # 交给 _classify 看缓存是否够用
+                                fetch_failed = True
+                                detail = "上游返回空数据"
                                 logger.warning(f"No data fetched for {symbol}")
                         except Exception as e:
-                            success = False
+                            fetch_failed = True
+                            detail = f"取数异常 {type(e).__name__}"
                             logger.error(f"Error processing {symbol}: {e}")
                         finally:
                             pbar.update(1)
-
-            return success
         except Exception as e:
             logger.error(f"Error fetching data: {e}")
-            return False
+            return FetchOutcome(symbol, FetchStatus.FATAL, f"同步异常 {type(e).__name__}: {e}")
+
+        return self._classify(
+            symbol,
+            end_date,
+            fetch_failed=fetch_failed,
+            stale_days=stale_days,
+            persist_failed=persist_failed,
+            detail=detail,
+        )
+
+    def fetch_data(
+        self,
+        symbol: str,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        db_client: Optional[DBClient] = None,
+    ) -> bool:
+        """获取股票数据；返回 False 仅表示致命失败，可降级（沿用缓存 / 仅基准）返回 True。"""
+        return not self.sync_symbol(symbol, start_date, end_date, db_client).fatal
 
 
 def main():
@@ -294,6 +403,12 @@ def main():
     )
     parser.add_argument("--workers", help="并发数", type=int, default=5)
     parser.add_argument("--retries", help="重试次数", type=int, default=3)
+    parser.add_argument(
+        "--benchmark-symbols",
+        help="基准代码（逗号分隔）：取不到新数据时只告警、不让进程失败；默认 "
+        + ",".join(sorted(BENCHMARK_SYMBOLS)),
+        default=None,
+    )
 
     args = parser.parse_args()
 
@@ -324,29 +439,43 @@ def main():
             return
         logger.info(f"找到 {len(symbols)} 个活跃股票需要更新")
 
-    manager = StockDataManager(max_workers=args.workers, max_retries=args.retries)
+    benchmark_symbols = (
+        [item.strip() for item in args.benchmark_symbols.split(",") if item.strip()]
+        if args.benchmark_symbols is not None
+        else None
+    )
+    manager = StockDataManager(
+        max_workers=args.workers, max_retries=args.retries, benchmark_symbols=benchmark_symbols
+    )
 
-    # 记录总体成功状态
-    overall_success = True
+    # 分级结果：致命 → 退出码 1；可降级（沿用缓存 / 仅基准）→ WARNING，退出码 0
+    fatal: List[FetchOutcome] = []
+    degraded: List[FetchOutcome] = []
 
     # 更新每个股票的数据
     for symbol in symbols:
         logger.info(f"\n开始更新 {symbol} 的数据...")
-        success = manager.fetch_data(
+        outcome = manager.sync_symbol(
             symbol=symbol, start_date=start_date, end_date=end_date, db_client=db_client
         )
-        if not success:
-            overall_success = False
-            logger.error(f"{symbol} 数据更新失败")
+        if outcome.status is FetchStatus.FATAL:
+            fatal.append(outcome)
+            logger.error(f"{symbol} 数据更新失败：{outcome.reason}")
+        elif outcome.status is FetchStatus.DEGRADED:
+            degraded.append(outcome)
+            logger.warning(f"{symbol} 数据更新降级：{outcome.reason}")
 
     # 关闭数据库连接
     db_client.close()
 
-    if overall_success:
-        logger.info("所有数据更新完成")
-    else:
-        logger.error("部分数据更新失败")
+    if degraded:
+        logger.warning(
+            "以下标的降级处理（不影响退出码）：" + "；".join(o.reason for o in degraded)
+        )
+    if fatal:
+        logger.error("部分数据更新失败：" + "；".join(o.reason for o in fatal))
         sys.exit(1)
+    logger.info("所有数据更新完成" if not degraded else "数据更新完成（含降级标的，见上方告警）")
 
 
 if __name__ == "__main__":
