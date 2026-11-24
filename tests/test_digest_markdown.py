@@ -3,7 +3,7 @@
 import json
 import re
 import tempfile
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import pytest
@@ -17,6 +17,7 @@ from trading.io.json_export import signal_extras
 pytestmark = pytest.mark.unit
 
 TODAY = date(2026, 3, 10)
+NOW = datetime(2026, 3, 10, 9, 0)  # naive UTC = 北京时间 17:00：A 股与港股的应有数据日都是 03-10
 EVIL = "<img src=x onerror=alert(1)> [点我](https://evil.example/?t=1) ![](https://evil.example/p.png) **粗** _斜_"
 
 
@@ -163,7 +164,7 @@ def build(reports=None, rotations=None, warnings=()):
         for r in (reports if reports is not None else [hold_report()])
     ]
     return build_full_markdown(
-        records, TODAY, rotations if rotations is not None else [rotation_report()], warnings
+        records, TODAY, rotations if rotations is not None else [rotation_report()], warnings, NOW
     )
 
 
@@ -232,8 +233,7 @@ def test_conclusion_flags_stale_data_and_missing_data():
     stale["dateRange"]["end"] = "2026-03-06"
     md = build(reports=[hold_report(), stale], warnings=["跳过损坏 JSON"])
     conclusion = section(md, "今日结论")
-    assert "⚠️ 数据截止日不一致，以 2026-03-10 为准" in conclusion
-    assert "- 落后 示例买入ETF（588000.SS）：2026-03-06" in conclusion
+    assert "⚠️ 数据落后：1 项比应有日期（03-10）早 4 天：示例买入ETF（588000.SS）" in conclusion
     assert "1 条数据提示" in conclusion and "## 数据提示" in md and "跳过损坏 JSON" in md
 
     empty = build(reports=[], rotations=[])

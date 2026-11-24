@@ -8,6 +8,7 @@ HTML 学策引邮件的视觉结构：顶部日期条 → 黄色警示框（结�
 from __future__ import annotations
 
 import html
+from dataclasses import replace
 from datetime import date
 from typing import Iterable
 
@@ -122,7 +123,7 @@ def _warn_box(view: View) -> str:
     rows.append(
         f'<div class="muted" style="margin-top:8px;font-size:13px;color:#6b7280;">{_x(stamp)}</div>'
     )
-    for warning in view.warnings:
+    for warning in view.warnings_full:  # 邮件版名字列全
         rows.append(
             '<div class="wline" style="margin-top:8px;background:#ffffff;border-radius:8px;padding:8px 10px;font-size:13.5px;color:#7a4b00;">'
             f"⚠️ {_x(warning)}</div>"
@@ -175,7 +176,9 @@ def build_email_html(view: View, title: str = "") -> str:
 
 def build_email_markdown(view: View) -> str:
     """邮件的纯文本版：与 iGotify 同一套分区卡片，再附完整细节。"""
-    base = render_full(build_push_parts_from_view(view)).rstrip("\n")
+    base = render_full(
+        build_push_parts_from_view(replace(view, warnings=view.warnings_full))
+    ).rstrip("\n")
     lines: list[str] = ["", "", "## 完整细节"]
     for zone in ZONES:
         for card in view.zones[zone]:
@@ -193,9 +196,10 @@ def build_email(
     warnings: Iterable[str] = (),
     generated_at: str | None = None,
     subject: str = "",
+    now: dt.datetime | None = None,
 ) -> tuple[str, str]:
     """返回 (Markdown 文本, HTML)。"""
     view = build_view(
-        reports, target_date, rotation_reports, warnings, generated_at, email_hint=False
+        reports, target_date, rotation_reports, warnings, generated_at, email_hint=False, now=now
     )
     return build_email_markdown(view), build_email_html(view, subject)

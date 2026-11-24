@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import re
 from datetime import date
 from typing import Iterable
@@ -149,6 +150,9 @@ def build_push_parts(
     warnings: Iterable[str] = (),
     generated_at: str | None = None,
     email_hint: bool = False,
+    now: dt.datetime | None = None,
 ) -> DigestParts:
-    view = build_view(reports, target_date, rotation_reports, warnings, generated_at, email_hint)
+    view = build_view(
+        reports, target_date, rotation_reports, warnings, generated_at, email_hint, now
+    )
     return build_push_parts_from_view(view)

@@ -9,7 +9,7 @@ from pathlib import Path
 from urllib import error
 
 import pytest
-from test_digest_markdown import assert_codes_named, buy_report, hold_report, rotation_report
+from test_digest_markdown import NOW, assert_codes_named, buy_report, hold_report, rotation_report
 
 from trading.io import digest
 from trading.io.channels import DispatchResult, Message, send_all
@@ -49,7 +49,7 @@ def make_parts(reports, rotations):
         )
         for r in reports
     ]
-    return build_digest_parts(records, TODAY, rotations, ["示例警告"])
+    return build_digest_parts(records, TODAY, rotations, ["示例警告"], NOW)
 
 
 def eleven_items():
