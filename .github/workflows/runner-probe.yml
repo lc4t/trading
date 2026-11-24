@@ -1,0 +1,19 @@
+name: runner-probe (临时，探测 GitHub 托管 runner 到行情接口的可达性)
+
+on:
+  push:
+    branches: ["claude/benchmark-eastmoney-source"]
+    paths: ["scripts/probe/**", ".github/workflows/runner-probe.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: 探测东财 / 腾讯指数日线（无令牌，不发任何通知）
+        run: python3 scripts/probe/runner_index_probe.py --rounds 12 --gap 2
