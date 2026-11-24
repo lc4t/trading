@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import re
 import unicodedata
 from dataclasses import dataclass
@@ -41,9 +42,9 @@ from .digest import (
     format_price,
     format_trade_date,
 )
+from .digest_freshness import classify, freshness_warnings, reference_label
 
 RECENT_ROTATIONS_SHOWN = 2
-MAX_LAG_DAYS = 5  # 数据截止日比报告日早超过这个天数（长假之外）就提示
 DASH = "—"
 LINE_WIDTH = 44  # 一行的显示宽度上限：全角字符算 2，约 22 个全角字符
 FIELD_SEP = "｜"
@@ -428,7 +429,7 @@ def _data_date(kind: str, raw: dict) -> str | None:
 
 
 def _conclusion(
-    entries: list[Entry], book: NameBook, target_date: date, warnings: list[str], latest: str | None
+    entries: list[Entry], book: NameBook, warnings: list[str], freshness_lines: list[str]
 ) -> list[str]:
     """今日结论：每条要点一组（第一行名称+动作，其后是依据），组之间空行分隔。"""
     if not entries:
@@ -445,23 +446,7 @@ def _conclusion(
     if not trades:
         hold = sum(1 for e in entries if e.item.action == "持有")
         groups.append(["今日无信号变化", *_bullets([f"持有 {hold}｜空仓 {len(entries) - hold}"])])
-    stale = [e for e in entries if latest and e.data_date and e.data_date < latest]
-    missing = [e for e in entries if not e.data_date]
-    if stale or missing:
-        groups.append(
-            [
-                f"⚠️ 数据截止日不一致，以 {latest or DASH} 为准",
-                *_bullets(f"落后 {_e(_entry_label(e, book))}：{e.data_date}" for e in stale),
-                *_bullets(f"日期缺失 {_e(_entry_label(e, book))}" for e in missing),
-            ]
-        )
-    elif latest:
-        try:
-            lag = (target_date - date.fromisoformat(latest)).days
-        except ValueError:
-            lag = 0
-        if lag > MAX_LAG_DAYS:
-            groups.append([f"⚠️ 数据整体落后：截止 {latest}，比报告日早 {lag} 天"])
+    groups += [[f"⚠️ {_e(line)}"] for line in freshness_lines]
     if warnings:
         groups.append([f"⚠️ 有 {len(warnings)} 条数据提示，见「数据提示」"])
     lines: list[str] = []
@@ -560,7 +545,6 @@ def _headline(entries: list[Entry]) -> str:
 class Collected:
     entries: list[Entry]
     book: NameBook
-    latest: str | None  # 各标的数据截止日里最新的一天
 
 
 def collect_entries(
@@ -580,8 +564,7 @@ def collect_entries(
             Entry(build_rotation_item(raw, date_str), "rotation", raw, _data_date("rotation", raw))
         )
     entries.sort(key=lambda e: (ACTION_PRIORITY.get(e.item.action, 99), e.item.key))
-    dates = [e.data_date for e in entries if e.data_date]
-    return Collected(entries, book, max(dates) if dates else None)
+    return Collected(entries, book)
 
 
 def build_digest_parts(
@@ -589,18 +572,24 @@ def build_digest_parts(
     target_date: date,
     rotation_reports: list[dict] | None = None,
     warnings: Iterable[str] = (),
+    now: dt.datetime | None = None,
 ) -> DigestParts:
-    """完整日报的结构化版本：摘要块（第 1 条）+ 按标的/小节划分的单元，供分段与整体渲染。"""
+    """完整日报的结构化版本：摘要块（第 1 条）+ 按标的/小节划分的单元，供分段与整体渲染。
+
+    now（naive UTC，缺省取当前时刻）用来推算各市场「应有的最后完成交易日」，作为数据新鲜度的参照日。"""
     date_str = target_date.isoformat()
     collected = collect_entries(reports, target_date, rotation_reports)
-    entries, book, latest = collected.entries, collected.book, collected.latest
+    entries, book = collected.entries, collected.book
+    fresh = classify(entries, now)
+    latest = reference_label(fresh)
+    freshness_lines = freshness_warnings(entries, fresh, lambda e: _entry_label(e, book), cap=None)
     warning_list = [book.annotate(w) for w in warnings if w]
 
     summary = [
         Block((f"# 📊 交易信号日报 · {date_str}",)),
-        Block((f"数据截止 {latest or DASH}｜共 {len(entries)} 项",)),
+        Block((f"数据截至 {latest or DASH}｜共 {len(entries)} 项",)),
         Block(
-            ("## 今日结论", "", *_conclusion(entries, book, target_date, warning_list, latest)),
+            ("## 今日结论", "", *_conclusion(entries, book, warning_list, freshness_lines)),
             body_start=2,
         ),
     ]
@@ -648,6 +637,7 @@ def build_full_markdown(
     target_date: date,
     rotation_reports: list[dict] | None = None,
     warnings: Iterable[str] = (),
+    now: dt.datetime | None = None,
 ) -> str:
-    """完整日报 Markdown（不分段，邮件用）；没有任何数据时在「今日结论」里直说，并保留边界声明。"""
-    return render_full(build_digest_parts(reports, target_date, rotation_reports, warnings))
+    """完整日报 Markdown（不分段）；没有任何数据时在「今日结论」里直说，并保留边界声明。"""
+    return render_full(build_digest_parts(reports, target_date, rotation_reports, warnings, now))

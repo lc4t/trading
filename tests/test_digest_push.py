@@ -3,7 +3,7 @@
 import json
 import re
 import tempfile
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from unittest import mock
 
@@ -23,6 +23,9 @@ from trading.io.digest_view import build_view
 pytestmark = pytest.mark.unit
 
 TODAY = date(2026, 3, 10)
+NOW = datetime(
+    2026, 3, 9, 16, 0
+)  # naive UTC = 北京时间 03-10 00:00（日报定时运行的时刻）：应有数据日 = 03-09
 GEN = "2026-03-10 13:45"
 ZONE_HEADINGS = ["🟢 买入信号", "🔴 卖出信号", "🔄 换仓信号", "🔵 持有状态", "⚪ 空仓状态"]
 VAGUE_WORDS = ("切换", "持仓 空仓", "None", "nan", "NaN", "占位")
@@ -219,11 +222,13 @@ def records(reports):
 
 
 def view_of(singles, rotations=(), warnings=(), hint=False):
-    return build_view(records(singles), TODAY, list(rotations), list(warnings), GEN, hint)
+    return build_view(records(singles), TODAY, list(rotations), list(warnings), GEN, hint, NOW)
 
 
 def parts_of(singles, rotations=(), warnings=(), hint=False):
-    return build_push_parts(records(singles), TODAY, list(rotations), list(warnings), GEN, hint)
+    return build_push_parts(
+        records(singles), TODAY, list(rotations), list(warnings), GEN, hint, NOW
+    )
 
 
 def push_text(singles, rotations=(), warnings=(), hint=False):
@@ -459,7 +464,7 @@ FULL_ENV = {
 
 def message_of(singles, rotations=(), warnings=()):
     md, html_doc = build_email(
-        records(singles), TODAY, list(rotations), list(warnings), GEN, "主题"
+        records(singles), TODAY, list(rotations), list(warnings), GEN, "主题", NOW
     )
     return Message(
         "📊 [2026-03-10] 示例",

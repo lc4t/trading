@@ -11,8 +11,9 @@ iGotify（Markdown，手机精简）与邮件（HTML，可更全）都从同一�
 
 from __future__ import annotations
 
+import datetime as dt
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date
 from typing import Iterable
 
@@ -22,6 +23,7 @@ from .digest import (
     format_price,
     format_trade_date,
 )
+from .digest_freshness import card_note, classify, freshness_warnings, reference_label
 from .digest_markdown import DASH, Collected, Entry, NameBook, _metric_value, _pct, collect_entries
 
 ZONES = ("买入", "卖出", "换仓", "持有", "空仓")
@@ -70,6 +72,7 @@ class View:
     metrics_lines: tuple[tuple[str, ...], ...]  # 策略级关键指标，每行一组字段
     zones: dict[str, list[Card]]
     email_hint: bool
+    warnings_full: tuple[str, ...] = field(default=())  # 邮件版警示：名字列全
     stale_labels: tuple[str, ...] = field(default=())
 
 
@@ -516,26 +519,30 @@ def build_view(
     warnings: Iterable[str] = (),
     generated_at: str | None = None,
     email_hint: bool = False,
+    now: dt.datetime | None = None,
 ) -> View:
+    """now 为 naive UTC（缺省取当前时刻），用来推算各市场「应有的最后完成交易日」。"""
     collected: Collected = collect_entries(reports, target_date, rotation_reports)
     book = collected.book
+    fresh = classify(collected.entries, now)
     zones: dict[str, list[Card]] = {zone: [] for zone in ZONES}
     cards: list[tuple[Entry, Card]] = []
     for entry in collected.entries:
         card = (
             _rotation_card(entry, book) if entry.kind == "rotation" else _symbol_card(entry, book)
         )
+        note = card_note(fresh[id(entry)])
+        if note:  # 数据截止日与参照日不符：在卡片里注明实际截止日
+            card = replace(card, rows=(*card.rows, (note,)))
         zones[card.zone].append(card)
         cards.append((entry, card))
     actions = tuple(_action_line(card) for zone in ("买入", "卖出", "换仓") for card in zones[zone])
-    latest = collected.latest
-    stale = [e for e in collected.entries if latest and e.data_date and e.data_date < latest]
-    missing = [e for e in collected.entries if not e.data_date]
+    latest = reference_label(fresh)
     flags: list[str] = []
-    flagged = [*stale, *missing]
-    if flagged:
-        first = _entry_title(flagged[0], book)
-        flags.append(f"数据落后：{first}" + (f" 等{len(flagged)}项" if len(flagged) > 1 else ""))
+    label_of = lambda e: _entry_title(e, book)  # noqa: E731
+    stale_lines = freshness_warnings(collected.entries, fresh, label_of)
+    flags += stale_lines
+    flagged = [e for e in collected.entries if fresh[id(e)].status != "ok"]
     records = [c for _, c in cards if c.flags]
     if records:
         shown = [f"{c.title}" for c in records[: MAX_FLAG_LINES - 1]]
@@ -572,6 +579,12 @@ def build_view(
         generated_at=generated_at,
         actions=actions,
         warnings=tuple(flags),
+        warnings_full=tuple(
+            [
+                *freshness_warnings(collected.entries, fresh, label_of, cap=None),
+                *flags[len(stale_lines) :],
+            ]
+        ),
         metrics_lines=tuple(metrics_lines),
         zones=zones,
         email_hint=email_hint,
