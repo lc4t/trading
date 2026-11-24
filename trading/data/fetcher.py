@@ -18,7 +18,8 @@ from ..market.clock import (
     is_final_snapshot,
     utcnow,
 )
-from ..market.fetchers import SYNC_RETRY, FetchResult, RangePriceFetcher, ths_etf_rows
+from ..market.fetchers import INDEX_ROUTES, SYNC_RETRY, FetchResult, RangePriceFetcher, ths_etf_rows
+from ..market.reconcile import Finding, reconcile_rows
 from ..market.store import MarketStore
 import argparse
 import adata  # noqa: F401  (保留模块级属性，测试按 trading.data.fetcher.adata 打补丁)
@@ -230,6 +231,28 @@ class StockDataManager:
             corporate.commit(self.market_store, symbol, self._pending_actions.pop(symbol, []), utcnow())
         return written > 0
 
+    def _reconcile(
+        self, symbol: str, rows: List[Dict[str, Any]], rejected: List[Finding]
+    ) -> List[Dict[str, Any]]:
+        """指数（不复权）新抓到的收盘价与库里已完成交易日对账；超过 0.5% 的行不覆盖，登记到 ``rejected``."""
+        if symbol not in INDEX_ROUTES or not rows:
+            return rows
+        try:
+            stored = self.market_store.query_range(
+                symbol, min(r["date"] for r in rows), max(r["date"] for r in rows)
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"{symbol} 对账读取库内数据失败，跳过对账：{e}")
+            return rows
+        kept, findings = reconcile_rows(rows, stored)
+        for item in findings:
+            if item.level == "error":
+                logger.error(f"{symbol} 对账失败（>0.5%，不覆盖）：{item.describe()}")
+                rejected.append(item)
+            else:
+                logger.warning(f"{symbol} 对账差异（>0.05%，仍写入新值）：{item.describe()}")
+        return kept
+
     def _cached_latest_date(self, symbol: str, end_date: Any) -> Optional[date]:
         """数据库里该标的、不晚于 ``end_date`` 的最新一行的日期；读失败按「没有缓存」处理.
 
@@ -301,6 +324,7 @@ class StockDataManager:
         persist_failed = False
         stale_days = 0
         detail = ""
+        reconcile_errors: List[Finding] = []
         # 只用已完成的日线：按标的所属市场的收盘时间，把结束日限制到最近一个已定稿的交易日
         requested_end = _as_date(end_date)
         end_date = completed_session_end(symbol, requested_end, self._now())
@@ -380,7 +404,8 @@ class StockDataManager:
                                         f"可能是还没开盘或数据未更新"
                                     )
 
-                                if not self._persist(symbol, data):
+                                to_write = self._reconcile(symbol, data, reconcile_errors)
+                                if to_write and not self._persist(symbol, to_write):
                                     persist_failed = True
                                     detail = "写库失败"
                                     logger.error(f"Failed to save data for {symbol}")
@@ -400,7 +425,7 @@ class StockDataManager:
             logger.error(f"Error fetching data: {e}")
             return FetchOutcome(symbol, FetchStatus.FATAL, f"同步异常 {type(e).__name__}: {e}")
 
-        return self._classify(
+        outcome = self._classify(
             symbol,
             end_date,
             fetch_failed=fetch_failed,
@@ -408,6 +433,13 @@ class StockDataManager:
             persist_failed=persist_failed,
             detail=detail,
         )
+        if reconcile_errors and outcome.status is FetchStatus.OK:
+            shown = "；".join(item.describe() for item in reconcile_errors[:3])
+            more = "" if len(reconcile_errors) <= 3 else f" 等 {len(reconcile_errors)} 行"
+            outcome = FetchOutcome(
+                symbol, FetchStatus.DEGRADED, f"{symbol} 对账未通过，未覆盖库内已有的收盘价：{shown}{more}"
+            )
+        return outcome
 
     def fetch_data(
         self,

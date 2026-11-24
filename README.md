@@ -67,6 +67,21 @@ uv run python -m trading.cli.backtest 159915.SZ \
 > 当天盘中那一根既不请求也不写入（上游不看区间时也会被裁掉）；库里已有的盘中半根会在收盘后被完整日线覆盖，已定稿的行不会被盘中值回退，
 > 回测读取库时也会跳过「正在交易、尚未定稿」的那一天。
 
+> **基准指数的取数顺序与对账**（`000300.SS` / `000300.SH` / `^HSI`）：
+> - `000300.SS`、`000300.SH`：腾讯日线 → 东财（`push2his` 对指数会间歇断连，专用 6 次、间隔 2~5 秒的重试，不用 `SYNC_RETRY`）→ 都失败则沿用库内缓存（`DEGRADED`，退出码 0）。Yahoo 对它只给最近一根日线，不再使用。
+> - `^HSI`：Yahoo 主源（历史完整）→ 腾讯 hkHSI 备源；东财 ^HSI 在 runner 上很不稳定，不依赖。
+> - 沿用「只同步已完成日线」的结束日规则，腾讯带出的当天盘中那根会被裁掉。
+> - 对账：新抓到的收盘价与库里**已完成**交易日比较，相对差 >0.05% 记 WARNING（仍写入）；>0.5% 记 ERROR 且**不覆盖**该行，本次结果记为 `DEGRADED`。库里是盘中写入的半根（`is_final=0`）不参与对账，由完整日线覆盖。
+> - 历史回补（默认 dry-run，只报告不写库）：
+>
+> ```bash
+> uv run python -m trading.cli.backfill_benchmark                       # dry-run：000300.SS，库内最早日期至最近已完成交易日
+> uv run python -m trading.cli.backfill_benchmark --symbol 000300.SS --symbol ^HSI --start-date 2024-12-01
+> uv run python -m trading.cli.backfill_benchmark --apply               # 写入缺失 / 未定稿的日线（对账差异行不覆盖）
+> ```
+>
+> 输出是 Markdown（缺失日期与数量、未定稿、对账差异、库内多出），设置了 `GITHUB_STEP_SUMMARY` 时同时写入 job summary；取不到源端数据时退出码 1。每日流程不会自动 `--apply`。
+
 > **`trading-fetcher` 退出码**：只有「致命失败」才非零——核心交易标的没有可用数据（上游取不到且缓存缺失/过旧，超过 2 个交易日），或写库失败。
 > 基准（默认 `000300.SS`、`000300.SH`、`^HSI`，可用 `--benchmark-symbols` 覆盖）取不到新数据，或核心标的上游当天为空但缓存仍够新，
 > 都只记 WARNING 并沿用缓存，退出码 0。背景：Yahoo 对 `000300.SS` 只提供最近一根日线，且 `end` 不含当天，
