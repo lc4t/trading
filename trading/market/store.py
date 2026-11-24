@@ -20,7 +20,7 @@ from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from sqlalchemy.orm import Session, sessionmaker
 
 from ..data.repository import Base, TradingData
-from .clock import awaiting_close, business_naive_now, utcnow
+from .clock import business_naive_now, latest_completed_date, utcnow
 from .errors import ReadOnlyError
 from .timing import install_statement_counter, timed
 from .rows import PRICE_FIELDS, clean_rows
@@ -260,34 +260,26 @@ class MarketStore:
             )
             return "raw" if stable == total else "legacy"
 
-    def _unfinished_session_day(self, session: Session, symbol: str) -> Optional[dt.date]:
-        """正在交易、尚未可定稿的那一天，且库里该日的行是盘中写入的（非终值）；否则 None.
+    @staticmethod
+    def _read_end(symbol: str, end: Any) -> Any:
+        """读库的结束日：不晚于请求的 ``end``，也不晚于该标的应有的最后完成日.
 
-        回测 / 基准读取要跳过它：白天跑出来的结果应与当天 0 点跑的一致，不能把盘中半根当成完整日线。
+        回测 / 基准读取只用已完成日线，白天跑出来的结果应与当天 0 点跑的一致。这里按日期收紧，
+        不依赖行上的 ``is_final`` 标记：库里晚于上界的行（当天盘中半根、旧代码写入的无标记行、
+        未来日期）一律在计算时忽略，不改库；它们会被收盘后的同步覆盖为完整日线。
         """
-        if not self.meta_enabled:
-            return None
-        info = awaiting_close(symbol, utcnow())
-        if not info:
-            return None
-        is_final = (
-            session.query(MarketDataMeta.is_final)
-            .filter(MarketDataMeta.symbol == symbol, MarketDataMeta.date == info["date"])
-            .scalar()
-        )
-        return info["date"] if is_final is False else None
+        cap = latest_completed_date(symbol, utcnow())
+        requested = end.date() if isinstance(end, dt.datetime) else end
+        return min(requested, cap) if isinstance(requested, dt.date) else cap
 
     def ohlcv_frame(self, symbol: str, start: Any, end: Any) -> pd.DataFrame:
-        """回测引擎取数：与历史上 ``fetch_symbol_data`` 返回的 DataFrame 完全一致."""
+        """回测引擎取数：与历史上 ``fetch_symbol_data`` 返回的 DataFrame 完全一致（结束日按已完成日线收紧）."""
         with self.ReadSession() as session:
             query = session.query(TradingData).filter(
                 TradingData.symbol == symbol,
                 TradingData.date >= start,
-                TradingData.date <= end,
+                TradingData.date <= self._read_end(symbol, end),
             )
-            unfinished = self._unfinished_session_day(session, symbol)
-            if unfinished is not None:
-                query = query.filter(TradingData.date != unfinished)
             df = pd.read_sql(query.statement, session.bind)
         if df.empty:
             return df
@@ -298,17 +290,18 @@ class MarketStore:
         return df
 
     def close_series(self, symbol: str, start: Any, end: Any) -> List[Any]:
-        """基准日收益用：[(date, close_price)]，按日期升序."""
+        """基准日收益用：[(date, close_price)]，按日期升序（结束日按已完成日线收紧）."""
         with self.ReadSession() as session:
-            query = session.query(TradingData).filter(
-                TradingData.symbol == symbol,
-                TradingData.date >= start,
-                TradingData.date <= end,
+            rows = (
+                session.query(TradingData)
+                .filter(
+                    TradingData.symbol == symbol,
+                    TradingData.date >= start,
+                    TradingData.date <= self._read_end(symbol, end),
+                )
+                .order_by(TradingData.date)
+                .all()
             )
-            unfinished = self._unfinished_session_day(session, symbol)
-            if unfinished is not None:
-                query = query.filter(TradingData.date != unfinished)
-            rows = query.order_by(TradingData.date).all()
             return [(r.date, float(r.close_price)) for r in rows]
 
     # ----------------------------------------------------------------- writes
