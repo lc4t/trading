@@ -20,7 +20,7 @@ from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from sqlalchemy.orm import Session, sessionmaker
 
 from ..data.repository import Base, TradingData
-from .clock import business_naive_now
+from .clock import awaiting_close, business_naive_now, utcnow
 from .errors import ReadOnlyError
 from .timing import install_statement_counter, timed
 from .rows import PRICE_FIELDS, clean_rows
@@ -260,19 +260,35 @@ class MarketStore:
             )
             return "raw" if stable == total else "legacy"
 
+    def _unfinished_session_day(self, session: Session, symbol: str) -> Optional[dt.date]:
+        """正在交易、尚未可定稿的那一天，且库里该日的行是盘中写入的（非终值）；否则 None.
+
+        回测 / 基准读取要跳过它：白天跑出来的结果应与当天 0 点跑的一致，不能把盘中半根当成完整日线。
+        """
+        if not self.meta_enabled:
+            return None
+        info = awaiting_close(symbol, utcnow())
+        if not info:
+            return None
+        is_final = (
+            session.query(MarketDataMeta.is_final)
+            .filter(MarketDataMeta.symbol == symbol, MarketDataMeta.date == info["date"])
+            .scalar()
+        )
+        return info["date"] if is_final is False else None
+
     def ohlcv_frame(self, symbol: str, start: Any, end: Any) -> pd.DataFrame:
         """回测引擎取数：与历史上 ``fetch_symbol_data`` 返回的 DataFrame 完全一致."""
         with self.ReadSession() as session:
-            df = pd.read_sql(
-                session.query(TradingData)
-                .filter(
-                    TradingData.symbol == symbol,
-                    TradingData.date >= start,
-                    TradingData.date <= end,
-                )
-                .statement,
-                session.bind,
+            query = session.query(TradingData).filter(
+                TradingData.symbol == symbol,
+                TradingData.date >= start,
+                TradingData.date <= end,
             )
+            unfinished = self._unfinished_session_day(session, symbol)
+            if unfinished is not None:
+                query = query.filter(TradingData.date != unfinished)
+            df = pd.read_sql(query.statement, session.bind)
         if df.empty:
             return df
         df["date"] = pd.to_datetime(df["date"])
@@ -284,16 +300,15 @@ class MarketStore:
     def close_series(self, symbol: str, start: Any, end: Any) -> List[Any]:
         """基准日收益用：[(date, close_price)]，按日期升序."""
         with self.ReadSession() as session:
-            rows = (
-                session.query(TradingData)
-                .filter(
-                    TradingData.symbol == symbol,
-                    TradingData.date >= start,
-                    TradingData.date <= end,
-                )
-                .order_by(TradingData.date)
-                .all()
+            query = session.query(TradingData).filter(
+                TradingData.symbol == symbol,
+                TradingData.date >= start,
+                TradingData.date <= end,
             )
+            unfinished = self._unfinished_session_day(session, symbol)
+            if unfinished is not None:
+                query = query.filter(TradingData.date != unfinished)
+            rows = query.order_by(TradingData.date).all()
             return [(r.date, float(r.close_price)) for r in rows]
 
     # ----------------------------------------------------------------- writes
@@ -316,6 +331,8 @@ class MarketStore:
         if self.read_only:
             raise ReadOnlyError("database is read-only")
         cleaned = clean_rows(rows)
+        if cleaned and price_basis is not None and self.meta_enabled:
+            cleaned = self._drop_downgrades(cleaned, final_flags)
         if not cleaned:
             return 0
         now_local = business_naive_now()
@@ -378,6 +395,35 @@ class MarketStore:
                 session.execute(mstmt)
             session.commit()
         return len(cleaned)
+
+    def _drop_downgrades(
+        self, rows: List[Dict[str, Any]], final_flags: Optional[Dict[dt.date, bool]]
+    ) -> List[Dict[str, Any]]:
+        """已定稿的行不会被盘中/未定稿的新抓取覆盖回非终值（反过来——收盘后的完整日线覆盖盘中半根——照常）."""
+        incoming_partial = [r for r in rows if not (final_flags or {}).get(r["date"], False)]
+        if not incoming_partial:
+            return rows
+        dates_by_symbol: Dict[str, set] = {}
+        for row in incoming_partial:
+            dates_by_symbol.setdefault(row["symbol"], set()).add(row["date"])
+        protected = set()
+        with self.Session() as session:
+            for symbol, days in dates_by_symbol.items():
+                found = (
+                    session.query(MarketDataMeta.date)
+                    .filter(
+                        MarketDataMeta.symbol == symbol,
+                        MarketDataMeta.date.in_(sorted(days)),
+                        MarketDataMeta.is_final.is_(True),
+                    )
+                    .all()
+                )
+                protected.update((symbol, d) for (d,) in found)
+        if not protected:
+            return rows
+        kept = [r for r in rows if (r["symbol"], r["date"]) not in protected or (final_flags or {}).get(r["date"], False)]
+        logger.warning(f"跳过 {len(rows) - len(kept)} 行：库里已是定稿值，新抓取尚未定稿（不回退为盘中值）")
+        return kept
 
     def _apply_conflict(self, stmt, update_cols: Dict[str, Any], index_elements: List[str]):
         if self.engine.dialect.name == "sqlite":

@@ -387,7 +387,9 @@ class RangePriceFetcher:
 
         if legacy:
             # 价格口径与历史完全一致（auto_adjust 默认 True）；多要分红/拆股事件，用来判断何时必须整段重写
-            kwargs: Dict[str, Any] = {"start": start, "end": end, "actions": True}
+            # Yahoo 的 end 不含当日，所以要 +1 天才能拿到 ``end`` 这一天已完成的日线（调用方保证 ``end``
+            # 不晚于最近一个已收盘的交易日；下面的循环仍会丢掉晚于 ``end`` 的行）
+            kwargs: Dict[str, Any] = {"start": start, "end": end + timedelta(days=1), "actions": True}
         else:
             kwargs = {
                 "start": start,

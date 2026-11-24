@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from enum import Enum
-from typing import Iterable, List, Optional, Any, Dict, Union
+from typing import Callable, Iterable, List, Optional, Any, Dict, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from argparse import ArgumentParser
 from abc import ABC, abstractmethod
@@ -11,7 +11,13 @@ from loguru import logger
 import traceback
 from .repository import DBClient
 from ..market import corporate
-from ..market.clock import as_of_for, is_final_snapshot, utcnow
+from ..market.clock import (
+    as_of_for,
+    business_today,
+    completed_session_end,
+    is_final_snapshot,
+    utcnow,
+)
 from ..market.fetchers import SYNC_RETRY, FetchResult, RangePriceFetcher, ths_etf_rows
 from ..market.store import MarketStore
 import argparse
@@ -109,7 +115,9 @@ class StockDataManager:
         max_workers: int = 1,
         max_retries: int = 5,
         benchmark_symbols: Optional[Iterable[str]] = None,
+        now: Callable[[], datetime] = utcnow,
     ):
+        self._now = now  # naive UTC；测试里可注入固定时刻
         self.benchmark_symbols = frozenset(
             BENCHMARK_SYMBOLS if benchmark_symbols is None else benchmark_symbols
         )
@@ -172,7 +180,12 @@ class StockDataManager:
                 result.actions = verdict.new
                 self._results[symbol] = result
             self._pending_actions[symbol] = verdict.new
-        data = result.rows
+        # 只保留已完成日线：有的上游（同花顺全量历史）不看 end，可能带出当天盘中那一根
+        data = [r for r in result.rows if r["date"] <= _as_date(end_date)]
+        if len(data) != len(result.rows):
+            logger.info(
+                f"{symbol} 丢弃 {len(result.rows) - len(data)} 行晚于 {end_date} 的数据（当日尚未收盘）"
+            )
 
         if data:
             # 获取实际数据的时间范围
@@ -217,10 +230,13 @@ class StockDataManager:
             corporate.commit(self.market_store, symbol, self._pending_actions.pop(symbol, []), utcnow())
         return written > 0
 
-    def _cached_latest_date(self, symbol: str) -> Optional[date]:
-        """数据库里该标的最新一行的日期；读失败按「没有缓存」处理."""
+    def _cached_latest_date(self, symbol: str, end_date: Any) -> Optional[date]:
+        """数据库里该标的、不晚于 ``end_date`` 的最新一行的日期；读失败按「没有缓存」处理.
+
+        不晚于 ``end_date`` = 不把盘中写入的当天半根当成可用缓存。
+        """
         try:
-            row = self.market_store.query_latest(symbol)
+            row = self.market_store.query_latest(symbol, before=_as_date(end_date) + timedelta(days=1))
         except Exception as e:  # noqa: BLE001
             logger.warning(f"读取 {symbol} 的缓存数据失败：{e}")
             return None
@@ -250,7 +266,7 @@ class StockDataManager:
             return FetchOutcome(symbol, FetchStatus.OK)
 
         if fetch_failed:
-            cached = self._cached_latest_date(symbol)
+            cached = self._cached_latest_date(symbol, end_date)
             end_day = _as_date(end_date)
             cached_age = self.count_trading_days(cached, end_day) if cached else None
             if cached is not None and cached_age <= MAX_STALE_TRADING_DAYS:
@@ -285,6 +301,13 @@ class StockDataManager:
         persist_failed = False
         stale_days = 0
         detail = ""
+        # 只用已完成的日线：按标的所属市场的收盘时间，把结束日限制到最近一个已定稿的交易日
+        requested_end = _as_date(end_date)
+        end_date = completed_session_end(symbol, requested_end, self._now())
+        if end_date != requested_end:
+            logger.info(
+                f"{symbol} 结束日期 {requested_end} → {end_date}（只同步已完成的日线，不请求当日盘中数据）"
+            )
         try:
             sym_start_date = start_date
             if not sym_start_date:
@@ -303,6 +326,10 @@ class StockDataManager:
                     logger.warning(
                         f"未找到 {symbol} 的上市日期，使用 {sym_start_date} 作为起始日期"
                     )
+
+            if _as_date(sym_start_date) > end_date:
+                logger.info(f"{symbol} 起始日期 {sym_start_date} 晚于 {end_date}，没有新的已完成日线需要同步")
+                return FetchOutcome(symbol, FetchStatus.OK)
 
             # 使用线程池并发获取数据
             with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
@@ -419,12 +446,14 @@ def main():
         start_date = None
 
     # 结束日期默认使用今天
-    end_date = datetime.now().date()
+    # 业务日（Asia/Shanghai）；各标的实际结束日由 sync_symbol 按所属市场收盘时间再收紧
+    today = business_today()
+    end_date = today
     if args.end_date:
         end_date = datetime.strptime(args.end_date, "%Y-%m-%d").date()
-        if end_date > datetime.now().date():
+        if end_date > today:
             logger.warning("结束日期超过今天，将使用今天作为结束日期")
-            end_date = datetime.now().date()
+            end_date = today
 
     # 创建数据库客户端
     db_client = DBClient()

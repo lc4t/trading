@@ -83,7 +83,9 @@ def test_yahoo_legacy_matches_historical_call_signature():
     result = RangePriceFetcher().fetch_yahoo(
         "^HSI", D(2024, 6, 3), D(2024, 6, 5), retry=SYNC_RETRY, legacy=True
     )
-    assert FakeTicker.calls[0] == {"start": D(2024, 6, 3), "end": D(2024, 6, 5), "actions": True}
+    # Yahoo 的 end 不含当日：要拿到 ``end`` 这一天已完成的日线必须 +1 天（批量同步只会传最近一个已收盘的交易日，
+    # 所以次日 0 点的同步请求仍是 end=「今天」，与改动前逐字一致）
+    assert FakeTicker.calls[0] == {"start": D(2024, 6, 3), "end": D(2024, 6, 6), "actions": True}
     assert result.price_basis == "yahoo_adjusted" and result.actions == []
 
 
